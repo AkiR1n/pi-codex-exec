@@ -369,10 +369,12 @@ test("pruneStaleLogs deletes only stale generated logs, preserves unrelated file
   const staleGenerated = `/private/tmp/pi-codex-exec-p1z-${randomUUID()}.log`;
   const freshGenerated = `/private/tmp/pi-codex-exec-p2z-${randomUUID()}.log`;
   const staleUnrelated = "/private/tmp/pi-codex-exec-test-stale.log";
-  await writeFile(staleGenerated, "old-generated", { mode: 0o600 });
-  await writeFile(freshGenerated, "new-generated", { mode: 0o600 });
-  await writeFile(staleUnrelated, "old-unrelated", { mode: 0o600 });
-  t.after(() => Promise.all([staleGenerated, freshGenerated, staleUnrelated].map((p) => unlink(p).catch(() => {}))));
+  const staleUppercase = `/private/tmp/PI-CODEX-EXEC-P1-${randomUUID().toUpperCase()}.log`;
+  const staleP0 = `/private/tmp/pi-codex-exec-p0-${randomUUID()}.log`;
+  const staleNonV4 = "/private/tmp/pi-codex-exec-p1-11111111-1111-1111-1111-111111111111.log";
+  const allTemp = [staleGenerated, freshGenerated, staleUnrelated, staleUppercase, staleP0, staleNonV4];
+  await Promise.all(allTemp.map((p) => writeFile(p, p, { mode: 0o600 })));
+  t.after(() => Promise.all(allTemp.map((p) => unlink(p).catch(() => {}))));
 
   const { exec } = harness(t);
   const live = await exec({ tty: false, cmd: "echo live; sleep 30", yield_time_ms: 100 });
@@ -380,16 +382,15 @@ test("pruneStaleLogs deletes only stale generated logs, preserves unrelated file
   const liveLog = trackLog(t, live.full_output_path);
 
   const oldDate = new Date(Date.now() - 48 * 60 * 60 * 1000);
-  await Promise.all([
-    utimes(staleGenerated, oldDate, oldDate),
-    utimes(staleUnrelated, oldDate, oldDate),
-    utimes(liveLog, oldDate, oldDate),
-  ]);
+  await Promise.all([staleGenerated, staleUnrelated, staleUppercase, staleP0, staleNonV4, liveLog].map((p) => utimes(p, oldDate, oldDate)));
 
   pruneStaleLogs(24 * 60 * 60 * 1000);
   await assert.rejects(stat(staleGenerated), { code: "ENOENT" });
-  assert.equal(await readFile(freshGenerated, "utf8"), "new-generated");
-  assert.equal(await readFile(staleUnrelated, "utf8"), "old-unrelated");
+  assert.equal(await readFile(freshGenerated, "utf8"), freshGenerated);
+  assert.equal(await readFile(staleUnrelated, "utf8"), staleUnrelated);
+  assert.equal(await readFile(staleUppercase, "utf8"), staleUppercase);
+  assert.equal(await readFile(staleP0, "utf8"), staleP0);
+  assert.equal(await readFile(staleNonV4, "utf8"), staleNonV4);
   assert.equal(await readFile(liveLog, "utf8"), "live\n");
 });
 

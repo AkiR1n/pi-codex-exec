@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, lstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { constants, homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -20,7 +20,7 @@ const TRUNCATION_MARKER = "\n… output truncated …\n";
 const LOG_DIR = "/private/tmp";
 const LOG_PREFIX = "pi-codex-exec-";
 const LOG_SUFFIX = ".log";
-const LOG_FILENAME_RE = /^pi-codex-exec-p[0-9a-z]+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.log$/i;
+const LOG_FILENAME_RE = /^pi-codex-exec-p[1-9a-z][0-9a-z]*-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.log$/;
 const LOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const activeLogPaths = new Set<string>();
 const SANDBOX_EXEC_BIN = "/usr/bin/sandbox-exec";
@@ -236,8 +236,8 @@ export function pruneStaleLogs(maxAgeMs = LOG_MAX_AGE_MS, activePaths?: Readonly
       const fullPath = LOG_DIR + "/" + name;
       if (activeLogPaths.has(fullPath) || activePaths?.has(fullPath)) continue;
       try {
-        const info = statSync(fullPath);
-        if (info.isFile() && info.mtimeMs < cutoff) unlinkSync(fullPath);
+        const info = lstatSync(fullPath);
+        if (info.isFile() && !info.isSymbolicLink() && info.mtimeMs < cutoff) unlinkSync(fullPath);
       } catch {
         // Ignore racing deletions or inaccessible files.
       }
