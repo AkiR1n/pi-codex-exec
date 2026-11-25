@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-面向 [Pi coding agent](https://pi.dev) 的轻量级、单轨 **Codex 风格统一命令执行**扩展。
+面向 [Pi coding agent](https://pi.dev) 的轻量级、单轨 **PTY 统一命令执行**扩展（`exec_command` + `write_stdin`）。
 
 相比同时维护阻塞式内置 `bash` 与独立的交互终端插件，`pi-codex-exec` 用一对可组合原语——`exec_command` 与 `write_stdin`——统一承载短命令同步执行与长任务/交互式 PTY 会话。它在 TUI、无头 `pi -p` 和子代理下行为完全一致，内置会话级实时全量日志镜像、严格的后代进程树回收，以及可选的 macOS Seatbelt（`sandbox-exec`）内核级敏感目录写保护。
 
@@ -87,6 +87,11 @@ npm test
 ```
 
 包含 21 条单元与集成测试，覆盖原生 PTY、管道、Ctrl+C/Ctrl+D、跨轮 ANSI 转义归一化、UTF-8 安全截断、跨轮实时全量日志镜像、24 小时旧日志清理、`setsid` 后代回收、`AbortSignal` 以及 macOS `sandbox-exec` 内核写拦截。
+
+## 参考声明
+
+- `exec_command` / `write_stdin` 双原语工具接口受 OpenAI Codex CLI 等现代终端编码 Agent 的统一 PTY 执行模型启发，基于 [`zigpty`](https://www.npmjs.com/package/zigpty) 面向 [Pi](https://pi.dev) 独立实现。
+- 本项目为独立社区扩展，与 OpenAI 或 Pi 官方无隶属或背书关系。
 
 ## 开源协议
 

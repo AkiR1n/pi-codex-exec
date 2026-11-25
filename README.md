@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A lightweight, single-track **Codex-style unified command execution** extension for the [Pi coding agent](https://pi.dev).
+A lightweight, single-track **unified PTY command execution** extension (`exec_command` + `write_stdin`) for the [Pi coding agent](https://pi.dev).
 
 Instead of splitting shell work between a blocking built-in `bash` tool and a separate interactive terminal plugin, `pi-codex-exec` replaces both with two composable primitives—`exec_command` and `write_stdin`—backed by native PTYs (`zigpty`) and pipes, identical behavior across TUI / headless `pi -p` / subagents, real-time full-transcript disk mirroring, strict `setsid`-aware process-tree reaping, and an opt-in macOS Seatbelt (`sandbox-exec`) write boundary.
 
@@ -106,6 +106,11 @@ npm test
 ```
 
 Runs 21 unit & integration tests covering native PTYs, pipes, Ctrl+C / Ctrl+D, ANSI control-sequence normalization across polls, UTF-8 / surrogate-safe truncation, multi-turn real-time session log mirroring, 24 h stale log pruning, `setsid` / reparented descendant reaping, `AbortSignal`, and real macOS `sandbox-exec` kernel write blocking.
+
+## References & Attribution
+
+- The two-primitive `exec_command` / `write_stdin` tool interface is inspired by the unified PTY command-execution model used in CLI coding agents such as OpenAI's Codex CLI, implemented independently from scratch for [Pi](https://pi.dev) on top of [`zigpty`](https://www.npmjs.com/package/zigpty).
+- This project is an independent community extension and is not affiliated with or endorsed by OpenAI or Pi.
 
 ## License
 
