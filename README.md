@@ -4,14 +4,14 @@ English | [简体中文](README.zh-CN.md)
 
 A lightweight, single-track **unified PTY command execution** extension (`exec_command` + `write_stdin`) for the [Pi coding agent](https://pi.dev).
 
-Instead of splitting shell work between a blocking built-in `bash` tool and a separate interactive terminal plugin, `pi-codex-exec` replaces both with two composable primitives—`exec_command` and `write_stdin`—backed by native PTYs (`zigpty`) and pipes, identical behavior across TUI / headless `pi -p` / subagents, real-time full-transcript disk mirroring, strict `setsid`-aware process-tree reaping, and an opt-in macOS Seatbelt (`sandbox-exec`) write boundary.
+Instead of splitting shell work between a blocking built-in `bash` tool and a separate interactive terminal plugin, `pi-codex-exec` replaces both with two composable primitives—`exec_command` and `write_stdin`—backed by native PTYs (`zigpty`) and pipes, identical behavior across TUI / headless `pi -p` / subagents, real-time full-transcript disk mirroring, `setsid`-aware process-tree reaping, and an opt-in macOS Seatbelt (`sandbox-exec`) write boundary.
 
 ## Why `pi-codex-exec`?
 
 - **Single-track model**: Short commands exit and return synchronously inside the initial `yield_time_ms` window; long-running or interactive processes (REPLs, debuggers, dev servers, SSH) seamlessly yield a `session_id` to continue with `write_stdin`. Models never have to guess between `bash` and a second interactive shell tool.
 - **Native `@gotgenes/pi-permission-system` parity**: Clean `cmd` / `workdir` arguments map directly into `shellTools`, letting safe commands pass at 0 ms while dangerous commands hit full bash AST rules.
 - **Unbroken real-time session logs (`full_output_path`)**: Short, non-truncated runs stay in memory with zero disk clutter. Any background session or truncated output streams every normalized byte in real time to a `0600` log file under `/private/tmp` so the model can `read(full_output_path)` without re-running commands. Stale logs older than 24 h are pruned opportunistically on startup.
-- **Strict process-tree reaping**: Tracks descendants across `setsid()` / reparenting by PID + start time and tears them down cleanly (`SIGTERM` → `SIGKILL`) on exit, `kill: true`, `AbortSignal`, or `session_shutdown`.
+- **Process-tree reaping**: Tracks descendants observed across `setsid()` / reparenting by PID + start time during periodic 250 ms sampling and tears them down cleanly (`SIGTERM` → `SIGKILL`) on exit, `kill: true`, `AbortSignal`, or `session_shutdown` (short-lived orphans that detach and reparent between 250 ms samples before parent exit cannot be guaranteed).
 - **Opt-in macOS Seatbelt write protection**: Flip one environment variable (`PI_CODEX_EXEC_SANDBOX=protect-sensitive`) to kernel-block writes to sensitive directories (`~/.ssh`, `~/.pi/agent/sessions`, `~/.pi/agent/auth.json`, permission configs, etc.) while keeping workspace and `/tmp` writes normal.
 - **Minimal footprint**: ~800 lines of TypeScript with a single runtime dependency (`zigpty`).
 
@@ -105,7 +105,7 @@ When active:
 npm test
 ```
 
-Runs 21 unit & integration tests covering native PTYs, pipes, Ctrl+C / Ctrl+D, ANSI control-sequence normalization across polls, UTF-8 / surrogate-safe truncation, multi-turn real-time session log mirroring, 24 h stale log pruning, `setsid` / reparented descendant reaping, `AbortSignal`, and real macOS `sandbox-exec` kernel write blocking.
+Runs 22 unit & integration tests covering native PTYs, pipes, Ctrl+C / Ctrl+D, ANSI control-sequence normalization across polls, UTF-8 / surrogate-safe truncation, multi-turn real-time session log mirroring, 24 h stale log pruning, `setsid` / reparented descendant reaping, `AbortSignal`, and real macOS `sandbox-exec` kernel write blocking.
 
 ## References & Attribution
 

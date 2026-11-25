@@ -20,7 +20,9 @@ const TRUNCATION_MARKER = "\n… output truncated …\n";
 const LOG_DIR = "/private/tmp";
 const LOG_PREFIX = "pi-codex-exec-";
 const LOG_SUFFIX = ".log";
+const LOG_FILENAME_RE = /^pi-codex-exec-p[0-9a-z]+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.log$/i;
 const LOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const activeLogPaths = new Set<string>();
 const SANDBOX_EXEC_BIN = "/usr/bin/sandbox-exec";
 
 export type SandboxMode = "off" | "protect-sensitive";
@@ -226,12 +228,13 @@ function tail(text: string, length: number) {
   return text.slice(first >= 0xdc00 && first <= 0xdfff ? start + 1 : start);
 }
 
-export function pruneStaleLogs(maxAgeMs = LOG_MAX_AGE_MS) {
+export function pruneStaleLogs(maxAgeMs = LOG_MAX_AGE_MS, activePaths?: ReadonlySet<string>) {
   try {
     const cutoff = Date.now() - maxAgeMs;
     for (const name of readdirSync(LOG_DIR)) {
-      if (!name.startsWith(LOG_PREFIX) || !name.endsWith(LOG_SUFFIX)) continue;
+      if (!LOG_FILENAME_RE.test(name)) continue;
       const fullPath = LOG_DIR + "/" + name;
+      if (activeLogPaths.has(fullPath) || activePaths?.has(fullPath)) continue;
       try {
         const info = statSync(fullPath);
         if (info.isFile() && info.mtimeMs < cutoff) unlinkSync(fullPath);
@@ -275,6 +278,7 @@ class SessionLog {
     writeFileSync(path, initial, { flag: "wx", mode: 0o600 });
     this.chunks = [];
     this.filePath = path;
+    activeLogPaths.add(path);
     return path;
   }
 
@@ -308,7 +312,7 @@ class SessionLog {
       const bytes = Buffer.from(text, "utf8");
       this.totalBytes += bytes.length;
       if (this.filePath) {
-        appendFileSync(this.filePath, bytes);
+        appendFileSync(this.filePath, bytes, { mode: 0o600 });
       } else {
         this.chunks.push(bytes);
         if (this.totalBytes > MEMORY_LIMIT) this.mirrorToDisk();
@@ -370,7 +374,9 @@ class SessionLog {
   }
 
   discard() {
-    if (!this.filePath || this.retained) return;
+    if (!this.filePath) return;
+    activeLogPaths.delete(this.filePath);
+    if (this.retained) return;
     try { unlinkSync(this.filePath); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
@@ -227,11 +228,23 @@ test("registered session_shutdown clears live PTY and pipe sessions and reaps th
   t.after(shutdown);
   const exec = tools.get("exec_command").execute;
   const write = tools.get("write_stdin").execute;
-  const runs = await Promise.all([true, false].map((tty) => exec("test", { cmd: "echo $$; exec sleep 30", tty, yield_time_ms: 100 })));
-  await shutdown();
-  for (const { structuredContent: run } of runs) {
-    await assertGone(Number(run.output.trim()));
-    await assert.rejects(write("test", { session_id: run.session_id }), /Unknown session_id/);
+  const logPaths = [];
+  try {
+    const runs = await Promise.all([true, false].map(async (tty) => {
+      const result = await exec("test", { cmd: "echo $$; exec sleep 30", tty, yield_time_ms: 100 });
+      if (result.structuredContent.full_output_path) logPaths.push(result.structuredContent.full_output_path);
+      return result;
+    }));
+    await shutdown();
+    for (const { structuredContent: run } of runs) {
+      await assertGone(Number(run.output.trim()));
+      await assert.rejects(write("test", { session_id: run.session_id }), /Unknown session_id/);
+    }
+  } finally {
+    await shutdown();
+    await Promise.all(logPaths.map((p) => unlink(p).catch((error) => {
+      if (error.code !== "ENOENT") throw error;
+    })));
   }
 });
 
@@ -330,18 +343,54 @@ test("background session mirrors unbroken transcript across turns in real time",
   assert.equal(await readFile(logPath, "utf8"), "TURN1\nTURN2_START_0123456789abcdefghijklmnopqrstuvwxyz_END\n");
 });
 
-test("pruneStaleLogs removes logs older than maxAgeMs and preserves fresh logs", async (t) => {
-  const stale = "/private/tmp/pi-codex-exec-test-stale.log";
-  const fresh = "/private/tmp/pi-codex-exec-test-fresh.log";
-  await writeFile(stale, "old", { mode: 0o600 });
-  await writeFile(fresh, "new", { mode: 0o600 });
-  t.after(() => Promise.all([stale, fresh].map((p) => unlink(p).catch(() => {}))));
+test("recreating a deleted live mirrored log file preserves 0600 permissions", { timeout: 5_000 }, async (t) => {
+  const { exec, write } = harness(t);
+  const start = await exec({
+    tty: false,
+    cmd: "printf 'BEFORE\\n'; read x; printf 'AFTER\\n'",
+    yield_time_ms: 100,
+  });
+  assert.equal(start.status, "running");
+  const logPath = trackLog(t, start.full_output_path);
+  assert.equal((await stat(logPath)).mode & 0o777, 0o600);
+
+  await unlink(logPath);
+  await assert.rejects(stat(logPath), { code: "ENOENT" });
+
+  const done = await write(start.session_id, { chars: "go\n" });
+  assert.equal(done.status, "exited");
+  assert.equal(done.exit_code, 0);
+  assert.equal(done.full_output_path, logPath);
+  assert.equal((await stat(logPath)).mode & 0o777, 0o600);
+  assert.equal(await readFile(logPath, "utf8"), "AFTER\n");
+});
+
+test("pruneStaleLogs deletes only stale generated logs, preserves unrelated filenames and live session logs", { timeout: 5_000 }, async (t) => {
+  const staleGenerated = `/private/tmp/pi-codex-exec-p1z-${randomUUID()}.log`;
+  const freshGenerated = `/private/tmp/pi-codex-exec-p2z-${randomUUID()}.log`;
+  const staleUnrelated = "/private/tmp/pi-codex-exec-test-stale.log";
+  await writeFile(staleGenerated, "old-generated", { mode: 0o600 });
+  await writeFile(freshGenerated, "new-generated", { mode: 0o600 });
+  await writeFile(staleUnrelated, "old-unrelated", { mode: 0o600 });
+  t.after(() => Promise.all([staleGenerated, freshGenerated, staleUnrelated].map((p) => unlink(p).catch(() => {}))));
+
+  const { exec } = harness(t);
+  const live = await exec({ tty: false, cmd: "echo live; sleep 30", yield_time_ms: 100 });
+  assert.equal(live.status, "running");
+  const liveLog = trackLog(t, live.full_output_path);
+
   const oldDate = new Date(Date.now() - 48 * 60 * 60 * 1000);
-  await utimes(stale, oldDate, oldDate);
+  await Promise.all([
+    utimes(staleGenerated, oldDate, oldDate),
+    utimes(staleUnrelated, oldDate, oldDate),
+    utimes(liveLog, oldDate, oldDate),
+  ]);
 
   pruneStaleLogs(24 * 60 * 60 * 1000);
-  await assert.rejects(stat(stale), { code: "ENOENT" });
-  assert.equal(await readFile(fresh, "utf8"), "new");
+  await assert.rejects(stat(staleGenerated), { code: "ENOENT" });
+  assert.equal(await readFile(freshGenerated, "utf8"), "new-generated");
+  assert.equal(await readFile(staleUnrelated, "utf8"), "old-unrelated");
+  assert.equal(await readFile(liveLog, "utf8"), "live\n");
 });
 
 test("buildSeatbeltProfile is undefined when off and covers sensitive defaults when enabled", () => {
