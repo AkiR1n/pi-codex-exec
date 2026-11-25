@@ -1,8 +1,8 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, closeSync, openSync, readdirSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { constants } from "node:os";
-import { resolve } from "node:path";
+import { appendFileSync, closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { constants, homedir } from "node:os";
+import { join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { setTimeout as delay } from "node:timers/promises";
 import { hasNative, spawn as spawnPty } from "zigpty";
@@ -21,6 +21,88 @@ const LOG_DIR = "/private/tmp";
 const LOG_PREFIX = "pi-codex-exec-";
 const LOG_SUFFIX = ".log";
 const LOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const SANDBOX_EXEC_BIN = "/usr/bin/sandbox-exec";
+
+export type SandboxMode = "off" | "protect-sensitive";
+export interface SandboxConfig {
+  mode: SandboxMode;
+  denyWritePaths?: string[];
+}
+
+function defaultSensitiveWritePaths(home = homedir()): string[] {
+  return [
+    join(home, ".pi/agent/sessions"),
+    join(home, ".pi/agent/auth.json"),
+    join(home, ".pi/agent/extensions/pi-permission-system"),
+    join(home, ".pi/agent/extensions/pi-permission-auto-review"),
+    join(home, ".config/magpie"),
+    join(home, ".ssh"),
+    join(home, ".gnupg"),
+    join(home, ".aws"),
+  ];
+}
+
+function resolveSandboxConfig(override?: SandboxConfig): SandboxConfig {
+  if (override) return override;
+  let mode: SandboxMode = "off";
+  const extraPaths: string[] = [];
+  const configPath = join(homedir(), ".pi/agent/extensions/pi-codex-exec.json");
+  if (existsSync(configPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(configPath, "utf8")) as { sandbox?: unknown; denyWritePaths?: unknown };
+      if (parsed.sandbox === "protect-sensitive" || parsed.sandbox === "off") mode = parsed.sandbox;
+      if (Array.isArray(parsed.denyWritePaths)) {
+        for (const entry of parsed.denyWritePaths) {
+          if (typeof entry === "string" && entry.trim()) extraPaths.push(entry.trim());
+        }
+      }
+    } catch {
+      // Malformed optional config falls back safely to defaults.
+    }
+  }
+  const envMode = process.env.PI_CODEX_EXEC_SANDBOX?.trim();
+  if (envMode === "off" || envMode === "protect-sensitive") mode = envMode;
+  const envPaths = process.env.PI_CODEX_EXEC_SANDBOX_DENY_WRITE?.trim();
+  if (envPaths) {
+    for (const entry of envPaths.split(":")) {
+      if (entry.trim()) extraPaths.push(entry.trim());
+    }
+  }
+  return { mode, denyWritePaths: extraPaths };
+}
+
+function escapeSbpl(value: string) {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+export function buildSeatbeltProfile(config: SandboxConfig): string | undefined {
+  if (config.mode !== "protect-sensitive") return undefined;
+  const rawPaths = [...defaultSensitiveWritePaths(), ...(config.denyWritePaths ?? [])];
+  const expanded = new Set<string>();
+  for (const raw of rawPaths) {
+    const abs = resolve(raw);
+    expanded.add(abs);
+    try {
+      if (existsSync(abs)) expanded.add(realpathSync(abs));
+    } catch {
+      // Keep unresolved path as well to block creation if missing.
+    }
+  }
+  const rules = ["(version 1)", "(allow default)"];
+  for (const target of expanded) {
+    const escaped = escapeSbpl(target);
+    rules.push(`(deny file-write* (literal "${escaped}") (subpath "${escaped}"))`);
+  }
+  return rules.join("\n");
+}
+
+function wrapCommandForSandbox(shell: string, args: string[], profile?: string): { bin: string; argv: string[] } {
+  if (!profile) return { bin: shell, argv: args };
+  if (process.platform !== "darwin" || !existsSync(SANDBOX_EXEC_BIN)) {
+    throw new Error("PI_CODEX_EXEC_SANDBOX=protect-sensitive requires macOS /usr/bin/sandbox-exec.");
+  }
+  return { bin: SANDBOX_EXEC_BIN, argv: ["-p", profile, shell, ...args] };
+}
 
 // Pi accepts JSON Schema here. These definitions also load in standalone Node.
 const string = { type: "string" } as const;
@@ -352,8 +434,9 @@ class Session {
     this.log = new SessionLog(id);
   }
 
-  start(cmd: string, shell: string, login: boolean, cwd: string) {
-    const args = login ? ["-l", "-c", cmd] : ["-c", cmd];
+  start(cmd: string, shell: string, login: boolean, cwd: string, sandboxProfile?: string) {
+    const shellArgs = login ? ["-l", "-c", cmd] : ["-c", cmd];
+    const { bin, argv } = wrapCommandForSandbox(shell, shellArgs, sandboxProfile);
     const stdout = new TerminalText();
     const stderr = new TerminalText();
     const finish = (code: number) => {
@@ -363,7 +446,7 @@ class Session {
     };
     if (this.tty) {
       if (!hasNative) throw new Error("Native zigpty bindings are required for tty:true.");
-      const pty = spawnPty(shell, args, {
+      const pty = spawnPty(bin, argv, {
         cwd,
         encoding: null,
         name: "xterm-256color",
@@ -376,7 +459,7 @@ class Session {
       return;
     }
 
-    const child = spawn(shell, args, { cwd, detached: true, stdio: "pipe" });
+    const child = spawn(bin, argv, { cwd, detached: true, stdio: "pipe" });
     this.pid = child.pid;
     child.stdout.on("data", (bytes: Buffer) => this.append(stdout.write(bytes)));
     child.stderr.on("data", (bytes: Buffer) => this.append(stderr.write(bytes)));
@@ -584,8 +667,10 @@ function toolResult(result: {
 
 type ExecutionContext = Pick<ExtensionContext, "cwd" | "ui">;
 
-export function createExecution() {
+export function createExecution(sandboxOverride?: SandboxConfig) {
   pruneStaleLogs();
+  const sandboxConfig = resolveSandboxConfig(sandboxOverride);
+  const sandboxProfile = buildSeatbeltProfile(sandboxConfig);
   const sessions = new Map<string, Session>();
   let nextId = 0;
   let shuttingDown = false;
@@ -613,7 +698,12 @@ export function createExecution() {
 
   function updateStatus() {
     const count = active().filter((session) => session.tty).length;
-    ui?.setStatus?.("pi-codex-exec", count ? count + " PTY • /pty" : undefined);
+    if (count) {
+      const tag = sandboxConfig.mode === "protect-sensitive" ? " [SB]" : "";
+      ui?.setStatus?.("pi-codex-exec", count + " PTY" + tag + " • /pty");
+    } else {
+      ui?.setStatus?.("pi-codex-exec", sandboxConfig.mode === "protect-sensitive" ? "SB • /pty" : undefined);
+    }
   }
 
   function forget(session: Session) {
@@ -661,7 +751,7 @@ export function createExecution() {
       });
       sessions.set(id, session);
       try {
-        session.start(cmd, shell, login, resolve(ctx?.cwd ?? process.cwd(), workdir ?? "."));
+        session.start(cmd, shell, login, resolve(ctx?.cwd ?? process.cwd(), workdir ?? "."), sandboxProfile);
         processSampler ??= setInterval(sampleProcesses, PROCESS_SAMPLE_MS).unref();
         await session.wait(yieldWindow(yield_time_ms), signal);
         signal?.throwIfAborted();

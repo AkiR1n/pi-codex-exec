@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFile, stat, unlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import register, { createExecution, pruneStaleLogs } from "../index.ts";
+import register, { buildSeatbeltProfile, createExecution, pruneStaleLogs } from "../index.ts";
 
-function harness(t, ctx = { cwd: process.cwd() }) {
-  const { execTool, writeTool, ptyCommand, shutdown } = createExecution();
+function harness(t, ctx = { cwd: process.cwd() }, sandboxOverride = { mode: "off" }) {
+  const { execTool, writeTool, ptyCommand, shutdown } = createExecution(sandboxOverride);
   const seenLogs = new Set();
   async function call(tool, input, signal) {
     assert.ok(tool.outputSchema);
@@ -342,4 +342,40 @@ test("pruneStaleLogs removes logs older than maxAgeMs and preserves fresh logs",
   pruneStaleLogs(24 * 60 * 60 * 1000);
   await assert.rejects(stat(stale), { code: "ENOENT" });
   assert.equal(await readFile(fresh, "utf8"), "new");
+});
+
+test("buildSeatbeltProfile is undefined when off and covers sensitive defaults when enabled", () => {
+  assert.equal(buildSeatbeltProfile({ mode: "off" }), undefined);
+  const sb = buildSeatbeltProfile({ mode: "protect-sensitive", denyWritePaths: ["/private/tmp/custom-deny"] });
+  assert.ok(sb);
+  assert.match(sb, /\(version 1\)/);
+  assert.match(sb, /\.pi\/agent\/sessions/);
+  assert.match(sb, /pi-permission-system/);
+  assert.match(sb, /\.ssh/);
+  assert.match(sb, /\/private\/tmp\/custom-deny/);
+});
+
+test("protect-sensitive Seatbelt sandbox blocks direct and indirect writes in PTY and pipe modes while allowing reads and workspace writes", { timeout: 10_000, skip: process.platform !== "darwin" }, async (t) => {
+  const root = await mkdtemp("/private/tmp/pi-codex-exec-sb-");
+  const protectedDir = root + "/protected";
+  const workDir = root + "/work";
+  await mkdir(protectedDir);
+  await mkdir(workDir);
+  await writeFile(protectedDir + "/secret.txt", "readable-secret\n");
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const { exec } = harness(t, { cwd: workDir }, { mode: "protect-sensitive", denyWritePaths: [protectedDir] });
+  for (const tty of [true, false]) {
+    const okWrite = await exec({ tty, cmd: `printf 'ok-%s' '${tty}' > '${workDir}/ok-${tty}.txt' && cat '${protectedDir}/secret.txt'` });
+    assert.equal(okWrite.status, "exited");
+    assert.equal(okWrite.exit_code, 0);
+    assert.match(okWrite.output, /readable-secret/);
+    assert.equal(await readFile(`${workDir}/ok-${tty}.txt`, "utf8"), `ok-${tty}`);
+
+    const blocked = await exec({ tty, cmd: `/usr/bin/python3 -c "open('${protectedDir}/pwn-${tty}.txt', 'w').write('nope')"` });
+    assert.equal(blocked.status, "exited");
+    assert.notEqual(blocked.exit_code, 0);
+    assert.match(blocked.output, /Operation not permitted|PermissionError/i);
+    await assert.rejects(stat(`${protectedDir}/pwn-${tty}.txt`), { code: "ENOENT" });
+  }
 });

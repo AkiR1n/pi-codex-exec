@@ -1,7 +1,31 @@
 {
   "name": "pi-codex-exec",
-  "private": true,
+  "version": "1.2.0",
+  "description": "Codex-style unified PTY/pipe shell execution (exec_command + write_stdin) for Pi coding agent with real-time session log mirroring, strict process-tree reaping, and opt-in macOS Seatbelt write protection.",
+  "license": "MIT",
   "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "codex",
+    "pty",
+    "zigpty",
+    "exec-command",
+    "sandbox-exec"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AkiR1n/pi-codex-exec.git"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
   "pi": {
     "extensions": [
       "./index.ts"
