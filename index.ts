@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, closeSync, openSync, readFileSync, readSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, openSync, readdirSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { constants } from "node:os";
 import { resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -17,6 +17,10 @@ const PROCESS_SAMPLE_MS = 250;
 const PROCESS_TERM_MS = 100;
 const PROCESS_REAP_MS = 500;
 const TRUNCATION_MARKER = "\n… output truncated …\n";
+const LOG_DIR = "/private/tmp";
+const LOG_PREFIX = "pi-codex-exec-";
+const LOG_SUFFIX = ".log";
+const LOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 // Pi accepts JSON Schema here. These definitions also load in standalone Node.
 const string = { type: "string" } as const;
@@ -140,89 +144,155 @@ function tail(text: string, length: number) {
   return text.slice(first >= 0xdc00 && first <= 0xdfff ? start + 1 : start);
 }
 
-function outputLog(text: string) {
-  const path = "/private/tmp/pi-codex-exec-" + randomUUID() + ".log";
-  writeFileSync(path, text, { flag: "wx", mode: 0o600 });
-  return path;
+export function pruneStaleLogs(maxAgeMs = LOG_MAX_AGE_MS) {
+  try {
+    const cutoff = Date.now() - maxAgeMs;
+    for (const name of readdirSync(LOG_DIR)) {
+      if (!name.startsWith(LOG_PREFIX) || !name.endsWith(LOG_SUFFIX)) continue;
+      const fullPath = LOG_DIR + "/" + name;
+      try {
+        const info = statSync(fullPath);
+        if (info.isFile() && info.mtimeMs < cutoff) unlinkSync(fullPath);
+      } catch {
+        // Ignore racing deletions or inaccessible files.
+      }
+    }
+  } catch {
+    // Best-effort cleanup only.
+  }
 }
 
-// One capture per output interval. Spill slow-reader output before it grows in memory.
-class Capture {
-  private text = "";
-  private path?: string;
-  private length = 0;
-  private bytes = 0;
+function truncateText(text: string, limit: number) {
+  const marker = limit > TRUNCATION_MARKER.length ? TRUNCATION_MARKER : "";
+  const available = limit - marker.length;
+  const first = Math.ceil(available / 2);
+  const last = available - first;
+  return head(text, first) + marker + tail(text, last);
+}
+
+// One persistent log per session. Buffers short sync runs in memory and mirrors
+// long-running or overflowing sessions to disk in real time so full_output_path
+// always contains the complete unbroken session transcript.
+class SessionLog {
+  private chunks: Buffer[] = [];
+  private filePath?: string;
+  private totalBytes = 0;
+  private cursorByte = 0;
+  private retained = false;
   private error?: unknown;
+  private readonly sessionId: string;
+
+  constructor(sessionId: string) {
+    this.sessionId = sessionId;
+  }
+
+  private mirrorToDisk() {
+    if (this.filePath) return this.filePath;
+    const path = `${LOG_DIR}/${LOG_PREFIX}${this.sessionId}-${randomUUID()}${LOG_SUFFIX}`;
+    const initial = this.chunks.length ? Buffer.concat(this.chunks) : Buffer.alloc(0);
+    writeFileSync(path, initial, { flag: "wx", mode: 0o600 });
+    this.chunks = [];
+    this.filePath = path;
+    return path;
+  }
+
+  private ensurePersisted() {
+    if (this.error) throw this.error;
+    const path = this.mirrorToDisk();
+    this.retained = true;
+    return path;
+  }
+
+  private readRange(offset: number, size: number) {
+    if (!size || !this.filePath) return Buffer.alloc(0);
+    const fd = openSync(this.filePath, "r");
+    try {
+      const buffer = Buffer.alloc(size);
+      let count = 0;
+      while (count < size) {
+        const n = readSync(fd, buffer, count, size - count, offset + count);
+        if (!n) break;
+        count += n;
+      }
+      return count === size ? buffer : buffer.subarray(0, count);
+    } finally {
+      closeSync(fd);
+    }
+  }
 
   append(text: string) {
     if (!text || this.error) return;
     try {
-      this.length += text.length;
-      if (this.path) {
-        appendFileSync(this.path, text);
-        this.bytes += Buffer.byteLength(text);
+      const bytes = Buffer.from(text, "utf8");
+      this.totalBytes += bytes.length;
+      if (this.filePath) {
+        appendFileSync(this.filePath, bytes);
       } else {
-        this.text += text;
-        if (this.length > MEMORY_LIMIT) {
-          this.path = outputLog(this.text);
-          this.bytes = Buffer.byteLength(this.text);
-          this.text = "";
-        }
+        this.chunks.push(bytes);
+        if (this.totalBytes > MEMORY_LIMIT) this.mirrorToDisk();
       }
     } catch (error) {
       this.error = error;
     }
   }
 
-  take(limit: number) {
+  take(limit: number, persistLog: boolean) {
     if (this.error) throw this.error;
-    if (this.length <= limit) {
-      const output = this.path ? readFileSync(this.path, "utf8") : this.text;
-      this.discard();
-      return { output, truncated: false };
+    const startByte = this.cursorByte;
+    const endByte = this.totalBytes;
+    this.cursorByte = endByte;
+    const deltaBytes = endByte - startByte;
+
+    if (!this.filePath) {
+      const all = this.chunks.length ? Buffer.concat(this.chunks) : Buffer.alloc(0);
+      const delta = all.subarray(startByte, endByte).toString("utf8");
+      if (delta.length <= limit) {
+        if (persistLog) {
+          return { output: delta, truncated: false, full_output_path: this.ensurePersisted() };
+        }
+        return { output: delta, truncated: false };
+      }
+      return { output: truncateText(delta, limit), truncated: true, full_output_path: this.ensurePersisted() };
     }
 
+    // A UTF-16 code unit encodes to at most three UTF-8 bytes (four for a 2-unit surrogate pair).
+    if (deltaBytes <= limit * 3) {
+      const delta = this.readRange(startByte, deltaBytes).toString("utf8");
+      if (delta.length <= limit) {
+        if (persistLog) {
+          this.retained = true;
+          return { output: delta, truncated: false, full_output_path: this.filePath };
+        }
+        return { output: delta, truncated: false };
+      }
+      this.retained = true;
+      return { output: truncateText(delta, limit), truncated: true, full_output_path: this.filePath };
+    }
+
+    this.retained = true;
     const marker = limit > TRUNCATION_MARKER.length ? TRUNCATION_MARKER : "";
     const available = limit - marker.length;
     const first = Math.ceil(available / 2);
     const last = available - first;
-    let start = this.text;
-    let end = this.text;
-    if (this.path) {
-      const fd = openSync(this.path, "r");
-      try {
-        const read = (size: number, fromEnd: boolean) => {
-          if (size === 0) return "";
-          // A UTF-16 code unit occupies at most three UTF-8 bytes on average.
-          const buffer = Buffer.alloc(Math.min(this.bytes, size * 3 + 4));
-          const offset = fromEnd ? this.bytes - buffer.length : 0;
-          let count = 0;
-          while (count < buffer.length) {
-            const n = readSync(fd, buffer, count, buffer.length - count, offset + count);
-            if (!n) break;
-            count += n;
-          }
-          let start = 0;
-          if (fromEnd) while (start < count && (buffer[start] & 0xc0) === 0x80) start++;
-          return buffer.toString("utf8", start, count);
-        };
-        start = read(first, false);
-        end = read(last, true);
-      } finally {
-        closeSync(fd);
-      }
+    const headLen = first ? Math.min(deltaBytes, first * 3 + 4) : 0;
+    const tailLen = last ? Math.min(deltaBytes, last * 3 + 4) : 0;
+    const startText = headLen ? this.readRange(startByte, headLen).toString("utf8") : "";
+    let endText = "";
+    if (tailLen) {
+      const tailBuf = this.readRange(endByte - tailLen, tailLen);
+      let skip = 0;
+      while (skip < tailBuf.length && (tailBuf[skip] & 0xc0) === 0x80) skip++;
+      endText = tailBuf.toString("utf8", skip);
     }
-    const full_output_path = this.path ?? outputLog(this.text);
-    this.path = undefined; // The caller now owns the returned log.
-    return { output: head(start, first) + marker + tail(end, last), truncated: true, full_output_path };
+    return { output: head(startText, first) + marker + tail(endText, last), truncated: true, full_output_path: this.filePath };
   }
 
   discard() {
-    if (!this.path) return;
-    try { unlinkSync(this.path); } catch (error) {
+    if (!this.filePath || this.retained) return;
+    try { unlinkSync(this.filePath); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    this.path = undefined;
+    this.filePath = undefined;
   }
 }
 
@@ -261,7 +331,7 @@ class Session {
   killed = false;
   expiry?: NodeJS.Timeout;
   history = "";
-  private capture = new Capture();
+  private log: SessionLog;
   private listeners = new Set<() => void>();
   private writeInput: (chars: string) => void = () => {};
   private closeIO: () => void = () => {};
@@ -279,6 +349,7 @@ class Session {
     this.id = id;
     this.tty = tty;
     this.onExit = onExit;
+    this.log = new SessionLog(id);
   }
 
   start(cmd: string, shell: string, login: boolean, cwd: string) {
@@ -346,7 +417,7 @@ class Session {
   }
 
   private append(text: string) {
-    this.capture.append(text);
+    this.log.append(text);
     this.history = tail(this.history + text, TAIL_LENGTH);
   }
 
@@ -475,14 +546,12 @@ class Session {
     } while (true);
   }
 
-  take(limit: number) {
+  take(limit: number, persistLog: boolean) {
     if (this.spawnError) throw this.spawnError;
-    const result = this.capture.take(limit);
-    this.capture = new Capture();
-    return result;
+    return this.log.take(limit, persistLog);
   }
 
-  discard() { this.capture.discard(); }
+  discard() { this.log.discard(); }
 }
 
 function outputLimit(tokens = DEFAULT_TOKENS) {
@@ -516,6 +585,7 @@ function toolResult(result: {
 type ExecutionContext = Pick<ExtensionContext, "cwd" | "ui">;
 
 export function createExecution() {
+  pruneStaleLogs();
   const sessions = new Map<string, Session>();
   let nextId = 0;
   let shuttingDown = false;
@@ -595,10 +665,11 @@ export function createExecution() {
         processSampler ??= setInterval(sampleProcesses, PROCESS_SAMPLE_MS).unref();
         await session.wait(yieldWindow(yield_time_ms), signal);
         signal?.throwIfAborted();
-        const output = { ...session.take(limit), wall_time_ms: Math.round(performance.now() - started) };
-        if (session.exitCode !== undefined) {
+        const running = session.exitCode === undefined;
+        const output = { ...session.take(limit, running), wall_time_ms: Math.round(performance.now() - started) };
+        if (!running) {
           forget(session);
-          return toolResult({ ...output, status: "exited", exit_code: session.exitCode });
+          return toolResult({ ...output, status: "exited", exit_code: session.exitCode! });
         }
         session.background = true;
         updateStatus();
@@ -638,7 +709,7 @@ export function createExecution() {
           await session.wait(yieldWindow(yield_time_ms), signal);
         }
         signal?.throwIfAborted();
-        const output = { ...session.take(limit), session_id, wall_time_ms: Math.round(performance.now() - started) };
+        const output = { ...session.take(limit, true), session_id, wall_time_ms: Math.round(performance.now() - started) };
         if (session.exitCode === undefined) return toolResult({ ...output, status: "running" });
         forget(session);
         return toolResult({ ...output, status: session.killed ? "killed" : "exited", exit_code: session.exitCode });

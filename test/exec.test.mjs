@@ -1,17 +1,25 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFile, stat, unlink } from "node:fs/promises";
+import { readFile, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import register, { createExecution } from "../index.ts";
+import register, { createExecution, pruneStaleLogs } from "../index.ts";
 
 function harness(t, ctx = { cwd: process.cwd() }) {
   const { execTool, writeTool, ptyCommand, shutdown } = createExecution();
+  const seenLogs = new Set();
   async function call(tool, input, signal) {
     assert.ok(tool.outputSchema);
     const result = await tool.execute("test", input, signal, undefined, ctx);
     assert.equal(result.content[0].type, "text");
     assert.ok(result.content[0].text.startsWith(result.structuredContent.status));
+    const logPath = result.structuredContent.full_output_path;
+    if (logPath && !seenLogs.has(logPath)) {
+      seenLogs.add(logPath);
+      t.after(() => unlink(logPath).catch((error) => {
+        if (error.code !== "ENOENT") throw error;
+      }));
+    }
     return result.structuredContent;
   }
   t.after(shutdown);
@@ -44,7 +52,9 @@ function cleanupPid(pid) {
 
 function trackLog(t, path) {
   assert.match(path, /^\/private\/tmp\/pi-codex-exec-.+\.log$/);
-  t.after(() => unlink(path));
+  t.after(() => unlink(path).catch((error) => {
+    if (error.code !== "ENOENT") throw error;
+  }));
   return path;
 }
 
@@ -294,4 +304,42 @@ test("AbortSignal cancels an initial wait and a background poll", { timeout: 5_0
   await assert.rejects(polling, { name: "AbortError" });
   await assertGone(Number(run.output.trim()));
   await assert.rejects(write(run.session_id), /Unknown session_id/);
+});
+
+test("background session mirrors unbroken transcript across turns in real time", { timeout: 5_000 }, async (t) => {
+  const { exec, write } = harness(t);
+  const start = await exec({
+    tty: false,
+    cmd: "printf 'TURN1\\n'; read x; printf 'TURN2_START_%s_END\\n' '0123456789abcdefghijklmnopqrstuvwxyz'",
+    yield_time_ms: 100,
+  });
+  assert.equal(start.status, "running");
+  assert.equal(start.output, "TURN1\n");
+  assert.equal(start.truncated, false);
+  const logPath = trackLog(t, start.full_output_path);
+  assert.equal((await stat(logPath)).mode & 0o777, 0o600);
+  assert.equal(await readFile(logPath, "utf8"), "TURN1\n");
+
+  const done = await write(start.session_id, { chars: "go\n", max_output_tokens: 6 });
+  assert.equal(done.status, "exited");
+  assert.equal(done.exit_code, 0);
+  assert.equal(done.truncated, true);
+  assert.equal(done.full_output_path, logPath);
+  assert.ok(done.output.length <= 24);
+  assert.doesNotMatch(done.output, /TURN1/);
+  assert.equal(await readFile(logPath, "utf8"), "TURN1\nTURN2_START_0123456789abcdefghijklmnopqrstuvwxyz_END\n");
+});
+
+test("pruneStaleLogs removes logs older than maxAgeMs and preserves fresh logs", async (t) => {
+  const stale = "/private/tmp/pi-codex-exec-test-stale.log";
+  const fresh = "/private/tmp/pi-codex-exec-test-fresh.log";
+  await writeFile(stale, "old", { mode: 0o600 });
+  await writeFile(fresh, "new", { mode: 0o600 });
+  t.after(() => Promise.all([stale, fresh].map((p) => unlink(p).catch(() => {}))));
+  const oldDate = new Date(Date.now() - 48 * 60 * 60 * 1000);
+  await utimes(stale, oldDate, oldDate);
+
+  pruneStaleLogs(24 * 60 * 60 * 1000);
+  await assert.rejects(stat(stale), { code: "ENOENT" });
+  assert.equal(await readFile(fresh, "utf8"), "new");
 });
