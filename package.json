@@ -1,0 +1,16 @@
+{
+  "name": "pi-codex-exec",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "zigpty": "^0.1.6"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}
