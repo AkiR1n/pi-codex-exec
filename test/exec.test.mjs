@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import register, { buildSeatbeltProfile, createExecution, pruneStaleLogs } from "../index.ts";
 
 function harness(t, ctx = { cwd: process.cwd() }, sandboxOverride = { mode: "off" }) {
-  const { execTool, writeTool, ptyCommand, shutdown } = createExecution(sandboxOverride);
+  const { execTool, ptyTool, writeTool, ptyCommand, shutdown } = createExecution(sandboxOverride);
   const seenLogs = new Set();
   async function call(tool, input, signal) {
     assert.ok(tool.outputSchema);
@@ -26,6 +26,7 @@ function harness(t, ctx = { cwd: process.cwd() }, sandboxOverride = { mode: "off
   t.after(shutdown);
   return {
     exec: (params, signal) => call(execTool, params, signal),
+    ptySession: (session_id, params, signal) => call(ptyTool, { session_id, ...params }, signal),
     write: (session_id, params, signal) => call(writeTool, { session_id, ...params }, signal),
     pty: (args) => ptyCommand.handler(args, ctx),
     shutdown,
@@ -227,7 +228,9 @@ test("registered session_shutdown clears live PTY and pipe sessions and reaps th
   });
   t.after(shutdown);
   const exec = tools.get("exec_command").execute;
+  const ptySession = tools.get("pty_session").execute;
   const write = tools.get("write_stdin").execute;
+  assert.ok(ptySession);
   const logPaths = [];
   try {
     const runs = await Promise.all([true, false].map(async (tty) => {
@@ -304,19 +307,110 @@ test("shutdown reaps a sampled group member that calls setsid before the shell e
   }
 });
 
-test("AbortSignal cancels an initial wait and a background poll", { timeout: 5_000 }, async (t) => {
-  const { exec, write } = harness(t);
+test("AbortSignal reaps an initial exec_command wait, preserves background sessions/output across poll aborts, and still honors pre-aborted kill", { timeout: 5_000 }, async (t) => {
+  const { exec, ptySession, write } = harness(t);
+  const pidFile = `/private/tmp/pi-codex-exec-abort-pid-${randomUUID()}.txt`;
+  t.after(() => unlink(pidFile).catch(() => {}));
+
   const controller = new AbortController();
-  const waiting = exec({ cmd: "exec sleep 30", yield_time_ms: 120_000 }, controller.signal);
-  setTimeout(() => controller.abort(), 100);
+  const waiting = exec({ tty: false, cmd: `echo $$ > '${pidFile}'; exec sleep 30`, yield_time_ms: 120_000 }, controller.signal);
+  setTimeout(() => controller.abort(), 150);
   await assert.rejects(waiting, { name: "AbortError" });
-  const run = await exec({ cmd: "echo $$; exec sleep 30", yield_time_ms: 100 });
+  const initialPid = Number((await readFile(pidFile, "utf8")).trim());
+  t.after(() => cleanupPid(initialPid));
+  await assertGone(initialPid);
+
+  const releaseFile = `/private/tmp/pi-codex-exec-abort-release-${randomUUID()}.txt`;
+  t.after(() => unlink(releaseFile).catch(() => {}));
+  const run = await exec({
+    tty: false,
+    shell: "/bin/sh",
+    cmd: `echo $$; while [ ! -f '${releaseFile}' ]; do sleep 0.02; done; printf 'BUFFERED\\n'; exec sleep 30`,
+    yield_time_ms: 100,
+  });
+  const pid = Number(run.output.trim());
+  t.after(() => cleanupPid(pid));
+  assert.equal(run.status, "running");
+
+  // Release output after the initial read and confirm it reached the log without polling.
+  await writeFile(releaseFile, "");
+  await delay(300);
+  assert.match(await readFile(run.full_output_path, "utf8"), /^BUFFERED$/m);
+
   const pollController = new AbortController();
-  const polling = write(run.session_id, { yield_time_ms: 120_000 }, pollController.signal);
-  pollController.abort();
+  const polling = ptySession(run.session_id, { yield_time_ms: 120_000 }, pollController.signal);
+  setTimeout(() => pollController.abort(), 50);
   await assert.rejects(polling, { name: "AbortError" });
-  await assertGone(Number(run.output.trim()));
-  await assert.rejects(write(run.session_id), /Unknown session_id/);
+
+  // Background process stays alive, unlocked, and retains unread output across poll/write wait aborts.
+  const writeController = new AbortController();
+  const writeWait = write(run.session_id, { yield_time_ms: 120_000 }, writeController.signal);
+  setTimeout(() => writeController.abort(), 50);
+  await assert.rejects(writeWait, { name: "AbortError" });
+
+  const stillAlive = await ptySession(run.session_id, { yield_time_ms: 400 });
+  assert.equal(stillAlive.status, "running");
+  assert.match(stillAlive.output, /^BUFFERED$/m);
+
+  // Explicit kill:true must still terminate the session even when the caller's signal is already aborted.
+  const preAborted = new AbortController();
+  preAborted.abort();
+  const killed = await ptySession(run.session_id, { kill: true }, preAborted.signal);
+  assert.equal(killed.status, "killed");
+  await assertGone(pid);
+  await assert.rejects(ptySession(run.session_id), /Unknown session_id/);
+});
+
+test("pty_session polls incremental output, terminates sessions, and rejects stdin chars or unknown parameters without writing to stdin", { timeout: 5_000 }, async (t) => {
+  const { exec, ptySession, write } = harness(t);
+  // 1. Live stdin reader proves rejected chars never reach the child's stdin.
+  const reader = await exec({
+    tty: false,
+    shell: "/bin/sh",
+    cmd: "printf 'READY\\n'; bytes=$(wc -c); printf 'BYTES:%d\\n' \"$bytes\"",
+    yield_time_ms: 100,
+  });
+  assert.equal(reader.status, "running");
+  assert.equal(reader.output, "READY\n");
+
+  await assert.rejects(
+    ptySession(reader.session_id, { chars: "injected" }),
+    /pty_session does not accept parameter "chars"/,
+  );
+  await assert.rejects(
+    ptySession(reader.session_id, { chars: "" }),
+    /pty_session does not accept parameter "chars"/,
+  );
+  await assert.rejects(
+    ptySession(reader.session_id, { extra: true }),
+    /pty_session does not accept parameter "extra"/,
+  );
+
+  const second = "second\n";
+  const written = await write(reader.session_id, { chars: second, yield_time_ms: 100 });
+  assert.equal(written.status, "running");
+  assert.equal(written.output, "");
+
+  const eof = await write(reader.session_id, { chars: "\x04", yield_time_ms: 1_000 });
+  assert.equal(eof.status, "exited");
+  assert.equal(eof.exit_code, 0);
+  assert.equal(eof.output, `BYTES:${Buffer.byteLength(second)}\n`);
+  await assert.rejects(ptySession(reader.session_id), /Unknown session_id/);
+
+  // 2. Normal incremental polling until natural exit.
+  const start = await exec({
+    tty: false,
+    cmd: "printf 'STEP1\\n'; sleep 0.2; printf 'STEP2\\n'",
+    yield_time_ms: 100,
+  });
+  assert.equal(start.status, "running");
+  assert.equal(start.output, "STEP1\n");
+
+  const done = await ptySession(start.session_id, { yield_time_ms: 2_000 });
+  assert.equal(done.status, "exited");
+  assert.equal(done.exit_code, 0);
+  assert.equal(done.output, "STEP2\n");
+  await assert.rejects(ptySession(start.session_id), /Unknown session_id/);
 });
 
 test("background session mirrors unbroken transcript across turns in real time", { timeout: 5_000 }, async (t) => {

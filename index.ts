@@ -157,6 +157,13 @@ interface WriteOptions {
   max_output_tokens?: number;
   kill?: boolean;
 }
+interface PtySessionOptions {
+  session_id: string;
+  yield_time_ms?: number;
+  max_output_tokens?: number;
+  kill?: boolean;
+}
+const PTY_SESSION_ALLOWED_KEYS = new Set(["session_id", "yield_time_ms", "max_output_tokens", "kill"]);
 
 // Keep terminal and UTF-8 parsing state across chunks and tool calls.
 class TerminalText {
@@ -731,7 +738,7 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
   const execTool = {
     name: "exec_command",
     label: "Exec Command",
-    description: "Run a shell command. Returns output and an exit code, or a session ID to continue with write_stdin.",
+    description: "Run a shell command. Returns output and an exit code, or a session ID to poll/stop with pty_session or send input with write_stdin.",
     parameters: objectSchema({
       cmd: { ...string, description: "Shell command to execute." },
       workdir: { ...string, description: "Working directory, relative to the Pi session cwd when applicable." },
@@ -777,10 +784,68 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
     },
   };
 
+  async function interactBackgroundSession(
+    { session_id, chars = "", yield_time_ms = 5_000, max_output_tokens, kill = false }: WriteOptions,
+    toolName: "pty_session" | "write_stdin",
+    signal?: AbortSignal,
+    ctx?: ExecutionContext,
+  ) {
+    if (!kill) signal?.throwIfAborted();
+    const session = sessions.get(session_id);
+    if (!session?.background) throw new Error("Unknown session_id: " + session_id);
+    if (session.busy) throw new Error("Session " + session_id + " already has a " + toolName + " or session call in progress.");
+    const limit = outputLimit(max_output_tokens);
+    const started = performance.now();
+    ui = ctx?.ui ?? ui;
+    session.busy = true;
+    try {
+      if (kill) await session.stop();
+      else {
+        if (chars) session.write(chars);
+        await session.wait(yieldWindow(yield_time_ms), signal);
+        signal?.throwIfAborted();
+      }
+      const output = { ...session.take(limit, true), session_id, wall_time_ms: Math.round(performance.now() - started) };
+      if (session.exitCode === undefined) return toolResult({ ...output, status: "running" });
+      forget(session);
+      return toolResult({ ...output, status: session.killed ? "killed" : "exited", exit_code: session.exitCode });
+    } catch (error) {
+      if (!kill && signal?.aborted) throw error;
+      await stopAndForget(session);
+      throw error;
+    } finally {
+      session.busy = false;
+    }
+  }
+
+  const ptyTool = {
+    name: "pty_session",
+    label: "PTY Session",
+    description: "Poll output from a background exec_command session or terminate its process tree. Never writes to stdin; use write_stdin to send input characters.",
+    parameters: objectSchema({
+      session_id: { ...string, description: "ID returned by exec_command." },
+      kill: { ...boolean, default: false, description: "Terminate the session's process tree." },
+      ...options,
+      yield_time_ms: { ...options.yield_time_ms, default: 5_000 },
+    }, ["session_id"]),
+    outputSchema: writeOutputSchema,
+    async execute(_id: string, params: PtySessionOptions, signal?: AbortSignal, _update?: unknown, ctx?: ExecutionContext) {
+      if (params && typeof params === "object") {
+        for (const key of Object.keys(params)) {
+          if (!PTY_SESSION_ALLOWED_KEYS.has(key)) {
+            throw new Error(`pty_session does not accept parameter "${key}". Use write_stdin to send input.`);
+          }
+        }
+      }
+      const { session_id, yield_time_ms = 5_000, max_output_tokens, kill = false } = params;
+      return interactBackgroundSession({ session_id, chars: "", yield_time_ms, max_output_tokens, kill }, "pty_session", signal, ctx);
+    },
+  };
+
   const writeTool = {
     name: "write_stdin",
     label: "Write Stdin",
-    description: "Send input to a session or poll for new output. Use kill to terminate its process tree.",
+    description: "Send input characters to a running session. Prefer pty_session for read-only output polling or killing without writing stdin.",
     parameters: objectSchema({
       session_id: { ...string, description: "ID returned by exec_command." },
       chars: { ...string, default: "", description: "Input text. Use newline to submit a line, Ctrl+C to interrupt, or Ctrl+D for EOF." },
@@ -789,32 +854,8 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
       yield_time_ms: { ...options.yield_time_ms, default: 5_000 },
     }, ["session_id"]),
     outputSchema: writeOutputSchema,
-    async execute(_id: string, { session_id, chars = "", yield_time_ms = 5_000, max_output_tokens, kill = false }: WriteOptions, signal?: AbortSignal, _update?: unknown, ctx?: ExecutionContext) {
-      signal?.throwIfAborted();
-      const session = sessions.get(session_id);
-      if (!session?.background) throw new Error("Unknown session_id: " + session_id);
-      if (session.busy) throw new Error("Session " + session_id + " already has a write_stdin call in progress.");
-      const limit = outputLimit(max_output_tokens);
-      const started = performance.now();
-      ui = ctx?.ui ?? ui;
-      session.busy = true;
-      try {
-        if (kill) await session.stop();
-        else {
-          session.write(chars);
-          await session.wait(yieldWindow(yield_time_ms), signal);
-        }
-        signal?.throwIfAborted();
-        const output = { ...session.take(limit, true), session_id, wall_time_ms: Math.round(performance.now() - started) };
-        if (session.exitCode === undefined) return toolResult({ ...output, status: "running" });
-        forget(session);
-        return toolResult({ ...output, status: session.killed ? "killed" : "exited", exit_code: session.exitCode });
-      } catch (error) {
-        await stopAndForget(session);
-        throw error;
-      } finally {
-        session.busy = false;
-      }
+    async execute(_id: string, params: WriteOptions, signal?: AbortSignal, _update?: unknown, ctx?: ExecutionContext) {
+      return interactBackgroundSession(params, "write_stdin", signal, ctx);
     },
   };
 
@@ -861,12 +902,13 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
     }
   }
 
-  return { execTool, writeTool, ptyCommand, shutdown };
+  return { execTool, ptyTool, writeTool, ptyCommand, shutdown };
 }
 
 export default function register(pi: ExtensionAPI) {
-  const { execTool, writeTool, ptyCommand, shutdown } = createExecution();
+  const { execTool, ptyTool, writeTool, ptyCommand, shutdown } = createExecution();
   pi.registerTool(execTool as unknown as ToolDefinition);
+  pi.registerTool(ptyTool as unknown as ToolDefinition);
   pi.registerTool(writeTool as unknown as ToolDefinition);
   pi.registerCommand("pty", ptyCommand);
   pi.on("session_shutdown", shutdown);
