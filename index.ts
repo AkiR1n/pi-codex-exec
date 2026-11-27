@@ -2,7 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, closeSync, existsSync, lstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { constants, homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { setTimeout as delay } from "node:timers/promises";
 import { hasNative, spawn as spawnPty } from "zigpty";
@@ -26,9 +26,15 @@ const activeLogPaths = new Set<string>();
 const SANDBOX_EXEC_BIN = "/usr/bin/sandbox-exec";
 
 export type SandboxMode = "off" | "protect-sensitive";
+export type SandboxSource = "override" | "env" | "config" | "default";
 export interface SandboxConfig {
   mode: SandboxMode;
   denyWritePaths?: string[];
+}
+export interface ResolvedSandboxConfig extends SandboxConfig {
+  source: SandboxSource;
+  warnings: string[];
+  configPath: string;
 }
 
 function defaultSensitiveWritePaths(home = homedir()): string[] {
@@ -44,51 +50,137 @@ function defaultSensitiveWritePaths(home = homedir()): string[] {
   ];
 }
 
-function resolveSandboxConfig(override?: SandboxConfig): SandboxConfig {
-  if (override) return override;
+export function expandSandboxPath(raw: string, home = homedir()): string {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.includes("\0")) {
+    throw new Error(`Invalid sandbox denyWritePath: ${JSON.stringify(raw)}`);
+  }
+  if (trimmed === "~") return resolve(home);
+  if (trimmed.startsWith("~/")) return resolve(home, trimmed.slice(2));
+  if (!trimmed.startsWith("/")) {
+    throw new Error(`Sandbox denyWritePath must be absolute or start with ~/: ${JSON.stringify(raw)}`);
+  }
+  return resolve(trimmed);
+}
+
+function canonicalizeWithExistingAncestor(absPath: string): string | undefined {
+  let current = absPath;
+  const missingSegments: string[] = [];
+  while (true) {
+    if (existsSync(current)) {
+      try {
+        const real = realpathSync(current);
+        return missingSegments.length ? join(real, ...missingSegments.reverse()) : real;
+      } catch {
+        return undefined;
+      }
+    }
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    missingSegments.push(basename(current));
+    current = parent;
+  }
+}
+
+export function resolveSandboxConfig(
+  override?: SandboxConfig,
+  options?: { configPath?: string; env?: NodeJS.ProcessEnv; home?: string },
+): ResolvedSandboxConfig {
+  const home = options?.home ?? homedir();
+  const configPath = options?.configPath ?? join(home, ".pi/agent/extensions/pi-codex-exec.json");
+  const env = options?.env ?? process.env;
+  const warnings: string[] = [];
+
+  if (override) {
+    const validPaths: string[] = [];
+    for (const entry of override.denyWritePaths ?? []) {
+      try {
+        validPaths.push(expandSandboxPath(entry, home));
+      } catch (error) {
+        warnings.push((error as Error).message);
+      }
+    }
+    return { mode: override.mode, denyWritePaths: validPaths, source: "override", warnings, configPath };
+  }
+
   let mode: SandboxMode = "off";
+  let source: SandboxSource = "default";
   const extraPaths: string[] = [];
-  const configPath = join(homedir(), ".pi/agent/extensions/pi-codex-exec.json");
+
   if (existsSync(configPath)) {
     try {
-      const parsed = JSON.parse(readFileSync(configPath, "utf8")) as { sandbox?: unknown; denyWritePaths?: unknown };
-      if (parsed.sandbox === "protect-sensitive" || parsed.sandbox === "off") mode = parsed.sandbox;
-      if (Array.isArray(parsed.denyWritePaths)) {
-        for (const entry of parsed.denyWritePaths) {
-          if (typeof entry === "string" && entry.trim()) extraPaths.push(entry.trim());
+      const parsed = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        warnings.push(`Ignoring malformed sandbox config at ${configPath}: expected a JSON object.`);
+      } else {
+        if (parsed.sandbox !== undefined) {
+          if (parsed.sandbox === "protect-sensitive" || parsed.sandbox === "off") {
+            mode = parsed.sandbox;
+            source = "config";
+          } else {
+            warnings.push(`Invalid sandbox mode in ${configPath}: ${JSON.stringify(parsed.sandbox)} (expected "off" or "protect-sensitive").`);
+          }
+        }
+        if (parsed.denyWritePaths !== undefined) {
+          if (!Array.isArray(parsed.denyWritePaths)) {
+            warnings.push(`Invalid denyWritePaths in ${configPath}: expected an array of paths.`);
+          } else {
+            for (const entry of parsed.denyWritePaths) {
+              if (typeof entry !== "string") {
+                warnings.push(`Ignoring non-string denyWritePath in ${configPath}: ${JSON.stringify(entry)}`);
+                continue;
+              }
+              try {
+                extraPaths.push(expandSandboxPath(entry, home));
+              } catch (error) {
+                warnings.push(`${configPath}: ${(error as Error).message}`);
+              }
+            }
+          }
         }
       }
-    } catch {
-      // Malformed optional config falls back safely to defaults.
+    } catch (error) {
+      warnings.push(`Failed to parse sandbox config ${configPath}: ${(error as Error).message}`);
     }
   }
-  const envMode = process.env.PI_CODEX_EXEC_SANDBOX?.trim();
-  if (envMode === "off" || envMode === "protect-sensitive") mode = envMode;
-  const envPaths = process.env.PI_CODEX_EXEC_SANDBOX_DENY_WRITE?.trim();
+
+  const envMode = env.PI_CODEX_EXEC_SANDBOX?.trim();
+  if (envMode) {
+    if (envMode === "off" || envMode === "protect-sensitive") {
+      mode = envMode;
+      source = "env";
+    } else {
+      warnings.push(`Ignoring invalid PI_CODEX_EXEC_SANDBOX=${JSON.stringify(envMode)} (expected "off" or "protect-sensitive").`);
+    }
+  }
+
+  const envPaths = env.PI_CODEX_EXEC_SANDBOX_DENY_WRITE?.trim();
   if (envPaths) {
     for (const entry of envPaths.split(":")) {
-      if (entry.trim()) extraPaths.push(entry.trim());
+      if (!entry.trim()) continue;
+      try {
+        extraPaths.push(expandSandboxPath(entry, home));
+      } catch (error) {
+        warnings.push(`PI_CODEX_EXEC_SANDBOX_DENY_WRITE: ${(error as Error).message}`);
+      }
     }
   }
-  return { mode, denyWritePaths: extraPaths };
+  return { mode, denyWritePaths: extraPaths, source, warnings, configPath };
 }
 
 function escapeSbpl(value: string) {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-export function buildSeatbeltProfile(config: SandboxConfig): string | undefined {
+export function buildSeatbeltProfile(config: SandboxConfig, home = homedir()): string | undefined {
   if (config.mode !== "protect-sensitive") return undefined;
-  const rawPaths = [...defaultSensitiveWritePaths(), ...(config.denyWritePaths ?? [])];
+  const rawPaths = [...defaultSensitiveWritePaths(home), ...(config.denyWritePaths ?? [])];
   const expanded = new Set<string>();
   for (const raw of rawPaths) {
-    const abs = resolve(raw);
+    const abs = expandSandboxPath(raw, home);
     expanded.add(abs);
-    try {
-      if (existsSync(abs)) expanded.add(realpathSync(abs));
-    } catch {
-      // Keep unresolved path as well to block creation if missing.
-    }
+    const canonical = canonicalizeWithExistingAncestor(abs);
+    if (canonical) expanded.add(canonical);
   }
   const rules = ["(version 1)", "(allow default)"];
   for (const target of expanded) {
@@ -422,6 +514,7 @@ class Session {
   exitCode?: number;
   spawnError?: Error;
   background = false;
+  sandboxed = false;
   busy = false;
   killed = false;
   expiry?: NodeJS.Timeout;
@@ -450,6 +543,7 @@ class Session {
   start(cmd: string, shell: string, login: boolean, cwd: string, sandboxProfile?: string) {
     const shellArgs = login ? ["-l", "-c", cmd] : ["-c", cmd];
     const { bin, argv } = wrapCommandForSandbox(shell, shellArgs, sandboxProfile);
+    this.sandboxed = Boolean(sandboxProfile);
     const stdout = new TerminalText();
     const stderr = new TerminalText();
     const finish = (code: number) => {
@@ -678,12 +772,16 @@ function toolResult(result: {
   return { structuredContent: result, content: [{ type: "text" as const, text: lines.filter(Boolean).join("\n") }] };
 }
 
-type ExecutionContext = Pick<ExtensionContext, "cwd" | "ui">;
+type ExecutionContext = Pick<ExtensionContext, "cwd" | "ui"> & { hasUI?: boolean };
 
 export function createExecution(sandboxOverride?: SandboxConfig) {
   pruneStaleLogs();
-  const sandboxConfig = resolveSandboxConfig(sandboxOverride);
-  const sandboxProfile = buildSeatbeltProfile(sandboxConfig);
+  const resolved = resolveSandboxConfig(sandboxOverride);
+  let sandboxMode: SandboxMode = resolved.mode;
+  const sandboxDenyWritePaths = [...(resolved.denyWritePaths ?? [])];
+  let sandboxSource: SandboxSource | "runtime" = resolved.source;
+  const sandboxWarnings = [...resolved.warnings];
+  let sandboxProfile = buildSeatbeltProfile({ mode: sandboxMode, denyWritePaths: sandboxDenyWritePaths });
   const sessions = new Map<string, Session>();
   let nextId = 0;
   let shuttingDown = false;
@@ -710,12 +808,29 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
   }
 
   function updateStatus() {
-    const count = active().filter((session) => session.tty).length;
+    const liveTtys = active().filter((session) => session.tty);
+    const count = liveTtys.length;
     if (count) {
-      const tag = sandboxConfig.mode === "protect-sensitive" ? " [SB]" : "";
-      ui?.setStatus?.("pi-codex-exec", count + " PTY" + tag + " • /pty");
+      const sbCount = liveTtys.filter((session) => session.sandboxed).length;
+      if (sbCount === count && sandboxMode === "protect-sensitive") {
+        ui?.setStatus?.("pi-codex-exec", count + " PTY [SB] • /pty");
+      } else if (sbCount === 0 && sandboxMode === "off") {
+        ui?.setStatus?.("pi-codex-exec", count + " PTY • /pty");
+      } else {
+        const nextTag = sandboxMode === "protect-sensitive" ? "SB" : "off";
+        ui?.setStatus?.("pi-codex-exec", `${count} PTY (${sbCount}/${count} SB) • next:${nextTag} • /pty`);
+      }
     } else {
-      ui?.setStatus?.("pi-codex-exec", sandboxConfig.mode === "protect-sensitive" ? "SB • /pty" : undefined);
+      ui?.setStatus?.("pi-codex-exec", sandboxMode === "protect-sensitive" ? "SB • /pty" : undefined);
+    }
+  }
+
+  function onSessionStart(ctx?: ExecutionContext) {
+    ui = ctx?.ui ?? ui;
+    updateStatus();
+    if (sandboxWarnings.length > 0) {
+      const msg = "pi-codex-exec sandbox config warning:\n" + sandboxWarnings.map((w) => "- " + w).join("\n");
+      ui?.notify?.(msg, "warning");
     }
   }
 
@@ -862,11 +977,15 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
   const ptyCommand = {
     description: "List execution sessions, show /pty tail <id>, or /pty kill <id|all>.",
     async handler(args: string, ctx?: ExecutionContext) {
-      ui = ctx?.ui;
+      ui = ctx?.ui ?? ui;
       const notify = (text: string) => ui?.notify?.(text, "info");
       const [action = "list", id, extra] = args.trim().split(/\s+/).filter(Boolean);
       if (action === "list" && !id) {
-        notify(active().map((session) => session.id + " " + (session.tty ? "PTY" : "pipes")).join("\n") || "No active execution sessions.");
+        notify(
+          active()
+            .map((session) => `${session.id} ${session.tty ? "PTY" : "pipes"} ${session.sandboxed ? "[SB]" : "[off]"}`)
+            .join("\n") || "No active execution sessions.",
+        );
         return;
       }
       if (!id || extra || (action !== "tail" && action !== "kill")) {
@@ -891,6 +1010,64 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
     },
   };
 
+  const sandboxCommand = {
+    description: "Inspect or live-toggle macOS Seatbelt write protection: /sandbox [status | on | off].",
+    async handler(args: string, ctx?: ExecutionContext) {
+      ui = ctx?.ui ?? ui;
+      const notify = (text: string, level: "info" | "warning" | "error" = "info") => ui?.notify?.(text, level);
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const action = (parts[0] ?? "status").toLowerCase();
+      if (parts.length > 1 || (action !== "status" && action !== "on" && action !== "off")) {
+        notify("Usage: /sandbox [status | on | off]", "warning");
+        return;
+      }
+      if (action === "on") {
+        if (process.platform !== "darwin" || !existsSync(SANDBOX_EXEC_BIN)) {
+          notify("protect-sensitive sandbox is currently macOS-only (/usr/bin/sandbox-exec required).", "warning");
+          return;
+        }
+        sandboxMode = "protect-sensitive";
+        sandboxSource = "runtime";
+        sandboxProfile = buildSeatbeltProfile({ mode: sandboxMode, denyWritePaths: sandboxDenyWritePaths });
+        updateStatus();
+        const liveNote = active().length ? " Existing background sessions keep their launch policy." : "";
+        notify("Sandbox enabled (protect-sensitive) for subsequent exec_command calls." + liveNote, "info");
+        return;
+      }
+      if (action === "off") {
+        if (ctx?.hasUI !== true) {
+          notify("Refused: /sandbox off requires an interactive UI operator.", "warning");
+          return;
+        }
+        sandboxMode = "off";
+        sandboxSource = "runtime";
+        sandboxProfile = undefined;
+        updateStatus();
+        const liveNote = active().length ? " Existing background sessions keep their launch policy." : "";
+        notify("Sandbox disabled (off) for subsequent exec_command calls." + liveNote, "warning");
+        return;
+      }
+      const liveSessions = active();
+      const lines = [
+        `pi-codex-exec sandbox (macOS-only Seatbelt):`,
+        `  mode: ${sandboxMode} (applies to new exec_command calls)`,
+        `  source: ${sandboxSource}`,
+        `  config: ${resolved.configPath}`,
+        `  extra denyWritePaths: ${sandboxDenyWritePaths.length ? sandboxDenyWritePaths.join(", ") : "(none)"}`,
+        `  active background sessions: ${
+          liveSessions.length
+            ? liveSessions.map((s) => `${s.id}[${s.sandboxed ? "SB" : "off"}]`).join(", ")
+            : "(none)"
+        }`,
+      ];
+      if (sandboxWarnings.length) {
+        lines.push("  warnings:");
+        for (const w of sandboxWarnings) lines.push(`    - ${w}`);
+      }
+      notify(lines.join("\n"), sandboxWarnings.length ? "warning" : "info");
+    },
+  };
+
   async function shutdown() {
     shuttingDown = true;
     try {
@@ -902,14 +1079,16 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
     }
   }
 
-  return { execTool, ptyTool, writeTool, ptyCommand, shutdown };
+  return { execTool, ptyTool, writeTool, ptyCommand, sandboxCommand, onSessionStart, shutdown };
 }
 
 export default function register(pi: ExtensionAPI) {
-  const { execTool, ptyTool, writeTool, ptyCommand, shutdown } = createExecution();
+  const { execTool, ptyTool, writeTool, ptyCommand, sandboxCommand, onSessionStart, shutdown } = createExecution();
   pi.registerTool(execTool as unknown as ToolDefinition);
   pi.registerTool(ptyTool as unknown as ToolDefinition);
   pi.registerTool(writeTool as unknown as ToolDefinition);
   pi.registerCommand("pty", ptyCommand);
+  pi.registerCommand("sandbox", sandboxCommand);
+  pi.on("session_start", (_event, ctx) => onSessionStart(ctx));
   pi.on("session_shutdown", shutdown);
 }

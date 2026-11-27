@@ -69,28 +69,34 @@ Map `exec_command` onto the native `bash` AST gate in `~/.pi/agent/extensions/pi
 
 Safe commands hit your existing `bash` allow rules immediately; dangerous commands (`rm -r`, `git push --force`, etc.) are intercepted with full AST parsing; `pty_session` passes the permission gate at 0 ms for background polling and termination without stdin write capability; `write_stdin` stays gated at tool level.
 
-### 3. Opt-in macOS Seatbelt Write Protection (`protect-sensitive`)
+### 3. macOS Seatbelt Write Protection (`protect-sensitive`, macOS-only)
 
-Default mode is `off`. To enable kernel-level write protection for sensitive directories on macOS:
+> **Platform note**: Kernel write protection relies on macOS `/usr/bin/sandbox-exec` (Seatbelt) and is currently **macOS-only**. On Linux / Windows, leave sandbox mode `off` (the default).
 
-- **Via environment variable** (great for gray rollout alongside normal `pi`):
+To enable kernel-level write protection for sensitive directories on macOS:
+
+- **Via environment variable** (overrides config file):
   ```sh
   PI_CODEX_EXEC_SANDBOX=protect-sensitive \
   PI_CODEX_EXEC_SANDBOX_DENY_WRITE="$HOME/my-private-data" \
   pi
   ```
-- **Via optional config file** (`~/.pi/agent/extensions/pi-codex-exec.json`):
+- **Via optional config file** (`~/.pi/agent/extensions/pi-codex-exec.json`, supports `~/` home expansion):
   ```json
   {
     "sandbox": "protect-sensitive",
-    "denyWritePaths": ["/Users/you/path/to/protect"]
+    "denyWritePaths": ["~/my-private-data"]
   }
   ```
+- **Live toggling inside a running Pi TUI session**:
+  - `/sandbox status` (or `/sandbox`) shows the active mode, source (`config` / `env` / `runtime` / `default`), effective protected paths, per-PTY sandbox state, and any config warnings.
+  - `/sandbox on` enables `protect-sensitive` for all subsequent `exec_command` calls without restarting Pi.
+  - `/sandbox off` disables Seatbelt for subsequent `exec_command` calls (interactive TUI only; rejected in headless / RPC mode). Existing background PTYs retain the sandbox policy they started with and are labeled accurately in the status bar.
 
 When active:
 - Workspace and `/tmp` reads/writes work normally; reads of protected paths still work (e.g. `ssh` reading `~/.ssh/config`).
 - Direct or indirect writes (including via Python/Node scripts) to `~/.pi/agent/sessions`, `~/.pi/agent/auth.json`, `~/.pi/agent/extensions/pi-permission-system`, `~/.pi/agent/extensions/pi-permission-auto-review`, `~/.config/magpie`, `~/.ssh`, `~/.gnupg`, `~/.aws`, and any custom `denyWritePaths` are rejected by the macOS kernel (`Operation not permitted`).
-- The status bar displays `SB • /pty` (or `N PTY [SB] • /pty`) so sandboxed sessions are visually distinct.
+- The status bar displays `SB • /pty` (or `N PTY [SB] • /pty`, or mixed counts after live toggling) so sandboxed sessions are visually distinct.
 
 ## Tool Surface & Commands
 
@@ -99,7 +105,8 @@ When active:
 | `exec_command` | `cmd`, `workdir?`, `tty?` (`true`), `shell?` (`/bin/zsh`), `login?` (`false`), `yield_time_ms?` (`10000`, clamped `100..120000`), `max_output_tokens?` (`10000`) | Returns `{ status, output, wall_time_ms, truncated, exit_code? \| session_id?, full_output_path? }`. Non-zero exit codes do not throw. |
 | `pty_session` | `session_id`, `kill?` (`false`), `yield_time_ms?` (`5000`), `max_output_tokens?` (`10000`) | Read-only output polling and process-tree termination. Strictly rejects `chars` and unknown keys at schema + runtime. |
 | `write_stdin` | `session_id`, `chars?` (`""`), `kill?` (`false`), `yield_time_ms?` (`5000`), `max_output_tokens?` (`10000`) | Sends `\n`, `\x03` (Ctrl+C), `\x04` (Ctrl+D) to interactive sessions. Always returns the unbroken session `full_output_path`. |
-| `/pty` | `/pty`, `/pty list`, `/pty tail <id>`, `/pty kill <id\|all>` | Interactive session inspection and cleanup inside Pi TUI. |
+| `/pty` | `/pty`, `/pty list`, `/pty tail <id>`, `/pty kill <id\|all>` | Interactive session inspection (including per-session `[SB]`/`[off]` state) and cleanup inside Pi TUI. |
+| `/sandbox` | `/sandbox [status \| on \| off]` | Live macOS Seatbelt inspection and toggling for subsequent `exec_command` calls (`off` requires interactive UI). |
 
 ## Testing
 
@@ -107,7 +114,7 @@ When active:
 npm test
 ```
 
-Runs 23 unit & integration tests covering native PTYs, pipes, `pty_session` polling/killing/runtime input-rejection, Ctrl+C / Ctrl+D, ANSI control-sequence normalization across polls, UTF-8 / surrogate-safe truncation, multi-turn real-time session log mirroring, 24 h stale log pruning, `setsid` / reparented descendant reaping, `AbortSignal`, and real macOS `sandbox-exec` kernel write blocking.
+Runs 26 unit & integration tests covering native PTYs, pipes, `pty_session` polling/killing/runtime input-rejection, Ctrl+C / Ctrl+D, ANSI control-sequence normalization across polls, UTF-8 / surrogate-safe truncation, multi-turn real-time session log mirroring, 24 h stale log pruning, `setsid` / reparented descendant reaping, `AbortSignal`, `~/` and symlink-ancestor Seatbelt path resolution, config diagnostics, `/sandbox` live toggling, and real macOS `sandbox-exec` kernel write blocking.
 
 ## References & Attribution
 

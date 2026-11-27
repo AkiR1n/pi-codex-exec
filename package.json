@@ -1,7 +1,7 @@
 {
   "name": "pi-codex-exec",
-  "version": "1.3.0",
-  "description": "Codex-style unified PTY/pipe shell execution (exec_command + pty_session + write_stdin) for Pi coding agent with real-time session log mirroring, strict process-tree reaping, and opt-in macOS Seatbelt write protection.",
+  "version": "1.4.0",
+  "description": "Codex-style unified PTY/pipe shell execution (exec_command + pty_session + write_stdin) for Pi coding agent with real-time session log mirroring, strict process-tree reaping, and macOS Seatbelt write protection with live /sandbox toggling.",
   "license": "MIT",
   "type": "module",
   "keywords": [

@@ -55,23 +55,29 @@ npm install
 }
 ```
 
-### 3. 开启 macOS Seatbelt 灰度写保护（默认关闭）
+### 3. macOS Seatbelt 写保护（`protect-sensitive`，暂仅支持 macOS）
 
-- **通过环境变量灰度启动**（适合独立 shell 别名如 `pisb`，与日常 `pi` 并行灰度）：
+> **平台说明**：内核级写保护基于 macOS `/usr/bin/sandbox-exec`（Seatbelt）实现，**目前仅支持 macOS**。Linux / Windows 环境下请保持默认 `off`。
+
+- **通过环境变量控制**（优先级高于配置文件）：
   ```sh
   PI_CODEX_EXEC_SANDBOX=protect-sensitive \
   PI_CODEX_EXEC_SANDBOX_DENY_WRITE="$HOME/my-private-data" \
   pi
   ```
-- **通过可选配置文件持久开启**（`~/.pi/agent/extensions/pi-codex-exec.json`）：
+- **通过可选配置文件持久开启**（`~/.pi/agent/extensions/pi-codex-exec.json`，支持 `~/` 家目录展开）：
   ```json
   {
     "sandbox": "protect-sensitive",
-    "denyWritePaths": ["/Users/you/path/to/protect"]
+    "denyWritePaths": ["~/my-private-data"]
   }
   ```
+- **运行中热切换（无需重启 Pi）**：
+  - `/sandbox status`（或 `/sandbox`）：查看当前沙箱模式、来源（`config` / `env` / `runtime` / `default`）、生效保护路径、各后台 PTY 沙箱状态与配置告警；
+  - `/sandbox on`：立即对后续新启动的 `exec_command` 开启 `protect-sensitive`；
+  - `/sandbox off`：对后续新启动的 `exec_command` 临时关闭沙箱（仅限交互式 TUI 操作者，无头 / RPC 模式下拒绝关闭）；已运行的旧后台 PTY 保留其启动时的策略并在状态栏准确标注。
 
-启用后，对 `~/.pi/agent/sessions`、`~/.pi/agent/auth.json`、`~/.pi/agent/extensions/pi-permission-system` 与 `~/.pi/agent/extensions/pi-permission-auto-review`、`~/.config/magpie`、`~/.ssh`、`~/.gnupg`、`~/.aws` 以及自定义 `denyWritePaths` 的任意写入都会被 macOS 内核拒绝（`Operation not permitted`），但仍保留正常只读访问（如 `ssh` 读取 `~/.ssh/config`）；状态栏会显示 `SB • /pty`（或 `N PTY [SB] • /pty`）便于区分。
+启用后，对 `~/.pi/agent/sessions`、`~/.pi/agent/auth.json`、`~/.pi/agent/extensions/pi-permission-system` 与 `~/.pi/agent/extensions/pi-permission-auto-review`、`~/.config/magpie`、`~/.ssh`、`~/.gnupg`、`~/.aws` 以及自定义 `denyWritePaths` 的任意写入都会被 macOS 内核拒绝（`Operation not permitted`），但仍保留正常只读访问（如 `ssh` 读取 `~/.ssh/config`）；状态栏会显示 `SB • /pty`（或 `N PTY [SB] • /pty`，热切混合状态时显示精确计数）便于区分。
 
 ## 工具与命令速查
 
@@ -80,7 +86,8 @@ npm install
 | `exec_command` | `cmd`, `workdir?`, `tty?` (`true`), `shell?` (`/bin/zsh`), `login?` (`false`), `yield_time_ms?` (`10000`, 范围 `100..120000`), `max_output_tokens?` (`10000`) | 返回 `{ status, output, wall_time_ms, truncated, exit_code? \| session_id?, full_output_path? }`；非零退出码不抛异常 |
 | `pty_session` | `session_id`, `kill?` (`false`), `yield_time_ms?` (`5000`), `max_output_tokens?` (`10000`) | 只读轮询后台输出或终止进程树；Schema 与运行时严格拒绝 `chars` 和未知参数 |
 | `write_stdin` | `session_id`, `chars?` (`""`), `kill?` (`false`), `yield_time_ms?` (`5000`), `max_output_tokens?` (`10000`) | 向交互会话发送 `\n`、`\x03`（Ctrl+C）、`\x04`（Ctrl+D）；始终返回完整会话 `full_output_path` |
-| `/pty` | `/pty`, `/pty list`, `/pty tail <id>`, `/pty kill <id\|all>` | 在 Pi TUI 中查看与清理后台会话 |
+| `/pty` | `/pty`, `/pty list`, `/pty tail <id>`, `/pty kill <id\|all>` | 在 Pi TUI 中查看（含各会话 `[SB]`/`[off]` 状态）与清理后台会话 |
+| `/sandbox` | `/sandbox [status \| on \| off]` | 运行中查看或热切换 macOS Seatbelt 写保护（`off` 仅限交互式 TUI） |
 
 ## 运行测试
 
@@ -88,7 +95,7 @@ npm install
 npm test
 ```
 
-包含 23 条单元与集成测试，覆盖原生 PTY、管道、`pty_session` 轮询/终止/运行时拒写校验、Ctrl+C/Ctrl+D、跨轮 ANSI 转义归一化、UTF-8 安全截断、跨轮实时全量日志镜像、24 小时旧日志清理、`setsid` 后代回收、`AbortSignal` 以及 macOS `sandbox-exec` 内核写拦截。
+包含 26 条单元与集成测试，覆盖原生 PTY、管道、`pty_session` 轮询/终止/运行时拒写校验、Ctrl+C/Ctrl+D、跨轮 ANSI 转义归一化、UTF-8 安全截断、跨轮实时全量日志镜像、24 小时旧日志清理、`setsid` 后代回收、`AbortSignal`、`~/` 与符号链接祖先路径解析、配置告警、`/sandbox` 运行中热切换以及 macOS `sandbox-exec` 内核写拦截。
 
 ## 参考声明
 

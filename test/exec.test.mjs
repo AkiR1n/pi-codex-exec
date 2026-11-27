@@ -4,10 +4,10 @@ import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import register, { buildSeatbeltProfile, createExecution, pruneStaleLogs } from "../index.ts";
+import register, { buildSeatbeltProfile, createExecution, expandSandboxPath, pruneStaleLogs, resolveSandboxConfig } from "../index.ts";
 
 function harness(t, ctx = { cwd: process.cwd() }, sandboxOverride = { mode: "off" }) {
-  const { execTool, ptyTool, writeTool, ptyCommand, shutdown } = createExecution(sandboxOverride);
+  const { execTool, ptyTool, writeTool, ptyCommand, sandboxCommand, onSessionStart, shutdown } = createExecution(sandboxOverride);
   const seenLogs = new Set();
   async function call(tool, input, signal) {
     assert.ok(tool.outputSchema);
@@ -28,7 +28,9 @@ function harness(t, ctx = { cwd: process.cwd() }, sandboxOverride = { mode: "off
     exec: (params, signal) => call(execTool, params, signal),
     ptySession: (session_id, params, signal) => call(ptyTool, { session_id, ...params }, signal),
     write: (session_id, params, signal) => call(writeTool, { session_id, ...params }, signal),
-    pty: (args) => ptyCommand.handler(args, ctx),
+    pty: (args, overrideCtx = ctx) => ptyCommand.handler(args, overrideCtx),
+    sandbox: (args, overrideCtx = ctx) => sandboxCommand.handler(args, overrideCtx),
+    sessionStart: (overrideCtx = ctx) => onSessionStart(overrideCtx),
     shutdown,
   };
 }
@@ -186,7 +188,7 @@ test("/pty lists, shows buffered tail, and kills single and all sessions; UI sta
   const second = await exec({ cmd: "echo second; exec sleep 30", yield_time_ms: 100 });
   assert.equal(statuses.at(-1).status, "2 PTY • /pty");
   await pty("");
-  assert.equal(notices.at(-1), first.session_id + " PTY\n" + second.session_id + " PTY");
+  assert.equal(notices.at(-1), first.session_id + " PTY [off]\n" + second.session_id + " PTY [off]");
   await pty("tail " + first.session_id);
   assert.equal(notices.at(-1), "first\n");
   await pty("kill " + first.session_id);
@@ -217,15 +219,20 @@ test("short-lived shells clean up jobs left in their process group", { timeout: 
 
 test("registered session_shutdown clears live PTY and pipe sessions and reaps the processes", { timeout: 5_000 }, async (t) => {
   const tools = new Map();
-  let shutdown;
+  const commands = new Set();
+  const handlers = new Map();
   register({
     registerTool: (tool) => tools.set(tool.name, tool),
-    registerCommand: () => {},
+    registerCommand: (name) => commands.add(name),
     on(event, handler) {
-      assert.equal(event, "session_shutdown");
-      shutdown = handler;
+      handlers.set(event, handler);
     },
   });
+  assert.ok(commands.has("pty"));
+  assert.ok(commands.has("sandbox"));
+  assert.equal(typeof handlers.get("session_start"), "function");
+  const shutdown = handlers.get("session_shutdown");
+  assert.equal(typeof shutdown, "function");
   t.after(shutdown);
   const exec = tools.get("exec_command").execute;
   const ptySession = tools.get("pty_session").execute;
@@ -522,4 +529,124 @@ test("protect-sensitive Seatbelt sandbox blocks direct and indirect writes in PT
     assert.match(blocked.output, /Operation not permitted|PermissionError/i);
     await assert.rejects(stat(`${protectedDir}/pwn-${tty}.txt`), { code: "ENOENT" });
   }
+});
+
+test("expandSandboxPath expands ~/, rejects relative paths, and buildSeatbeltProfile resolves symlinked ancestors for nonexistent targets", () => {
+  assert.equal(expandSandboxPath("~/Dev/agents/pi-memory-data", "/Users/tester"), "/Users/tester/Dev/agents/pi-memory-data");
+  assert.equal(expandSandboxPath("~", "/Users/tester"), "/Users/tester");
+  assert.throws(() => expandSandboxPath("relative/path", "/Users/tester"), /must be absolute or start with ~\//);
+  assert.throws(() => expandSandboxPath("", "/Users/tester"), /Invalid sandbox denyWritePath/);
+
+  const sb = buildSeatbeltProfile({
+    mode: "protect-sensitive",
+    denyWritePaths: ["~/custom-data", "/tmp/nonexistent-ancestor-probe-42/nested"],
+  }, "/Users/tester");
+  assert.ok(sb);
+  assert.match(sb, /\(subpath "\/Users\/tester\/custom-data"\)/);
+  assert.doesNotMatch(sb, /~\/custom-data/);
+  if (process.platform === "darwin") {
+    assert.match(sb, /\(subpath "\/private\/tmp\/nonexistent-ancestor-probe-42\/nested"\)/);
+  }
+});
+
+test("resolveSandboxConfig reports malformed config, invalid entries, and env override precedence", async (t) => {
+  const dir = await mkdtemp("/private/tmp/pi-codex-exec-cfg-");
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const badJson = dir + "/bad.json";
+  await writeFile(badJson, "{not-json");
+  const bad = resolveSandboxConfig(undefined, { configPath: badJson, env: {}, home: "/Users/tester" });
+  assert.equal(bad.mode, "off");
+  assert.equal(bad.source, "default");
+  assert.ok(bad.warnings.some((w) => /Failed to parse sandbox config/.test(w)));
+
+  const goodJson = dir + "/good.json";
+  await writeFile(goodJson, JSON.stringify({
+    sandbox: "protect-sensitive",
+    denyWritePaths: ["~/protected", "relative/bad"],
+  }));
+  const loaded = resolveSandboxConfig(undefined, { configPath: goodJson, env: {}, home: "/Users/tester" });
+  assert.equal(loaded.mode, "protect-sensitive");
+  assert.equal(loaded.source, "config");
+  assert.deepEqual(loaded.denyWritePaths, ["/Users/tester/protected"]);
+  assert.ok(loaded.warnings.some((w) => /must be absolute/.test(w)));
+
+  const envOver = resolveSandboxConfig(undefined, {
+    configPath: goodJson,
+    env: { PI_CODEX_EXEC_SANDBOX: "off" },
+    home: "/Users/tester",
+  });
+  assert.equal(envOver.mode, "off");
+  assert.equal(envOver.source, "env");
+});
+
+test("/sandbox hot-toggles subsequent exec_command calls, rejects headless off, and tracks per-PTY status accurately", { timeout: 10_000, skip: process.platform !== "darwin" }, async (t) => {
+  const root = await mkdtemp("/private/tmp/pi-codex-exec-toggle-");
+  const protectedDir = root + "/protected";
+  await mkdir(protectedDir);
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const statuses = [];
+  const notes = [];
+  const interactiveCtx = {
+    cwd: root,
+    hasUI: true,
+    ui: {
+      setStatus: (key, status) => statuses.push({ key, status }),
+      notify: (text, level) => notes.push({ text, level }),
+    },
+  };
+  const headlessCtx = {
+    cwd: root,
+    hasUI: false,
+    ui: {
+      setStatus: (key, status) => statuses.push({ key, status }),
+      notify: (text, level) => notes.push({ text, level }),
+    },
+  };
+
+  const { exec, ptySession, sandbox, sessionStart } = harness(
+    t,
+    interactiveCtx,
+    { mode: "protect-sensitive", denyWritePaths: [protectedDir] },
+  );
+
+  sessionStart();
+  assert.equal(statuses.at(-1)?.status, "SB • /pty");
+
+  // Headless / RPC caller cannot disable sandbox.
+  await sandbox("off", headlessCtx);
+  assert.match(notes.at(-1)?.text ?? "", /interactive UI/i);
+  assert.equal(notes.at(-1)?.level, "warning");
+
+  // Start a sandboxed background PTY while sandbox is ON.
+  const bg = await exec({ tty: true, cmd: "echo ready; sleep 30", yield_time_ms: 150 });
+  assert.equal(bg.status, "running");
+  assert.equal(statuses.at(-1)?.status, "1 PTY [SB] • /pty");
+
+  // Interactive operator turns sandbox OFF: status must reflect mixed state (old PTY still SB, next is off).
+  await sandbox("off", interactiveCtx);
+  assert.match(statuses.at(-1)?.status ?? "", /1 PTY \(1\/1 SB\) • next:off • \/pty/);
+
+  // New command now writes to protectedDir freely.
+  const allowed = await exec({ tty: false, cmd: `printf 'ok' > '${protectedDir}/after-off.txt'` });
+  assert.equal(allowed.status, "exited");
+  assert.equal(allowed.exit_code, 0);
+  assert.equal(await readFile(`${protectedDir}/after-off.txt`, "utf8"), "ok");
+
+  // Turn sandbox back ON: next command is blocked by kernel again.
+  await sandbox("on", interactiveCtx);
+  assert.equal(statuses.at(-1)?.status, "1 PTY [SB] • /pty");
+  const blocked = await exec({ tty: false, cmd: `printf 'no' > '${protectedDir}/after-on.txt'` });
+  assert.equal(blocked.status, "exited");
+  assert.notEqual(blocked.exit_code, 0);
+  assert.match(blocked.output, /Operation not permitted/i);
+  await assert.rejects(stat(`${protectedDir}/after-on.txt`), { code: "ENOENT" });
+
+  await sandbox("status", interactiveCtx);
+  assert.match(notes.at(-1)?.text ?? "", /mode: protect-sensitive/);
+  assert.match(notes.at(-1)?.text ?? "", /source: runtime/);
+
+  await ptySession(bg.session_id, { kill: true });
+  assert.equal(statuses.at(-1)?.status, "SB • /pty");
 });
