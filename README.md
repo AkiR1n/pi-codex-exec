@@ -114,7 +114,7 @@ When active:
 npm test
 ```
 
-Runs 26 unit & integration tests covering native PTYs, pipes, `pty_session` polling/killing/runtime input-rejection, Ctrl+C / Ctrl+D, ANSI control-sequence normalization across polls, UTF-8 / surrogate-safe truncation, multi-turn real-time session log mirroring, 24 h stale log pruning, `setsid` / reparented descendant reaping, `AbortSignal`, `~/` and symlink-ancestor Seatbelt path resolution, config diagnostics, `/sandbox` live toggling, and real macOS `sandbox-exec` kernel write blocking.
+Runs 27 unit & integration tests covering native PTYs, pipes, `pty_session` polling/killing/runtime input-rejection, Ctrl+C / Ctrl+D, ANSI control-sequence normalization across polls, UTF-8 / surrogate-safe truncation, multi-turn real-time session log mirroring, 24 h stale log pruning, `setsid` / reparented descendant reaping, `AbortSignal`, `~/` and symlink-ancestor Seatbelt path resolution, config diagnostics (including unknown-key warnings), `/sandbox` live toggling (including RPC/headless rejection and width-safe widget rendering), and real macOS `sandbox-exec` kernel write blocking.
 
 ## References & Attribution
 

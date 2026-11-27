@@ -95,7 +95,7 @@ npm install
 npm test
 ```
 
-包含 26 条单元与集成测试，覆盖原生 PTY、管道、`pty_session` 轮询/终止/运行时拒写校验、Ctrl+C/Ctrl+D、跨轮 ANSI 转义归一化、UTF-8 安全截断、跨轮实时全量日志镜像、24 小时旧日志清理、`setsid` 后代回收、`AbortSignal`、`~/` 与符号链接祖先路径解析、配置告警、`/sandbox` 运行中热切换以及 macOS `sandbox-exec` 内核写拦截。
+包含 27 条单元与集成测试，覆盖原生 PTY、管道、`pty_session` 轮询/终止/运行时拒写校验、Ctrl+C/Ctrl+D、跨轮 ANSI 转义归一化、UTF-8 安全截断、跨轮实时全量日志镜像、24 小时旧日志清理、`setsid` 后代回收、`AbortSignal`、`~/` 与符号链接祖先路径解析、配置告警（含未知键检测）、`/sandbox` 运行中热切换（含 RPC/无头拒绝与窄屏宽度安全截断）以及 macOS `sandbox-exec` 内核写拦截。
 
 ## 参考声明
 

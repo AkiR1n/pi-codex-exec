@@ -113,6 +113,12 @@ export function resolveSandboxConfig(
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
         warnings.push(`Ignoring malformed sandbox config at ${configPath}: expected a JSON object.`);
       } else {
+        const allowedKeys = new Set(["sandbox", "denyWritePaths"]);
+        for (const key of Object.keys(parsed)) {
+          if (!allowedKeys.has(key)) {
+            warnings.push(`Unknown sandbox config key in ${configPath}: ${JSON.stringify(key)} (expected "sandbox" or "denyWritePaths").`);
+          }
+        }
         if (parsed.sandbox !== undefined) {
           if (parsed.sandbox === "protect-sensitive" || parsed.sandbox === "off") {
             mode = parsed.sandbox;
@@ -172,9 +178,8 @@ function escapeSbpl(value: string) {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-export function buildSeatbeltProfile(config: SandboxConfig, home = homedir()): string | undefined {
-  if (config.mode !== "protect-sensitive") return undefined;
-  const rawPaths = [...defaultSensitiveWritePaths(home), ...(config.denyWritePaths ?? [])];
+export function resolveProtectedWritePaths(denyWritePaths: readonly string[] = [], home = homedir()): string[] {
+  const rawPaths = [...defaultSensitiveWritePaths(home), ...denyWritePaths];
   const expanded = new Set<string>();
   for (const raw of rawPaths) {
     const abs = expandSandboxPath(raw, home);
@@ -182,6 +187,12 @@ export function buildSeatbeltProfile(config: SandboxConfig, home = homedir()): s
     const canonical = canonicalizeWithExistingAncestor(abs);
     if (canonical) expanded.add(canonical);
   }
+  return [...expanded];
+}
+
+export function buildSeatbeltProfile(config: SandboxConfig, home = homedir()): string | undefined {
+  if (config.mode !== "protect-sensitive") return undefined;
+  const expanded = resolveProtectedWritePaths(config.denyWritePaths, home);
   const rules = ["(version 1)", "(allow default)"];
   for (const target of expanded) {
     const escaped = escapeSbpl(target);
@@ -772,7 +783,7 @@ function toolResult(result: {
   return { structuredContent: result, content: [{ type: "text" as const, text: lines.filter(Boolean).join("\n") }] };
 }
 
-type ExecutionContext = Pick<ExtensionContext, "cwd" | "ui"> & { hasUI?: boolean };
+type ExecutionContext = Pick<ExtensionContext, "cwd" | "ui"> & { hasUI?: boolean; mode?: string };
 
 export function createExecution(sandboxOverride?: SandboxConfig) {
   pruneStaleLogs();
@@ -832,14 +843,19 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
       if (sandboxMode === "protect-sensitive" || sandboxSource === "runtime" || count > 0) {
         const sbLabel = sandboxMode === "protect-sensitive"
           ? "SB on (protect-sensitive)"
-          : "SB off (runtime)";
+          : `SB off (${sandboxSource})`;
         const extra = count > 0 ? ` • ${statusText}` : (sandboxMode === "protect-sensitive" ? " • /sandbox" : " • /sandbox on");
         const line = `  ${sbLabel}${extra}`;
         const isWarn = sandboxMode === "off" && sandboxSource === "runtime";
         ui.setWidget(
           "pi-codex-exec",
           (_tui, theme) => ({
-            render: () => [theme?.fg ? theme.fg(isWarn ? "warning" : "dim", line) : line],
+            render: (width?: number) => {
+              const clipped = typeof width === "number"
+                ? (width <= 0 ? "" : line.slice(0, width))
+                : line;
+              return [theme?.fg ? theme.fg(isWarn ? "warning" : "dim", clipped) : clipped];
+            },
             invalidate: () => {},
           }),
           { placement: "belowEditor" },
@@ -1060,8 +1076,8 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
         return;
       }
       if (action === "off") {
-        if (ctx?.hasUI !== true) {
-          notify("Refused: /sandbox off requires an interactive UI operator.", "warning");
+        if (ctx?.hasUI !== true || ctx?.mode !== "tui") {
+          notify("Refused: /sandbox off requires an interactive TUI session (headless/RPC rejected).", "warning");
           return;
         }
         sandboxMode = "off";
@@ -1073,12 +1089,14 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
         return;
       }
       const liveSessions = active();
+      const protectedPaths = resolveProtectedWritePaths(sandboxDenyWritePaths);
       const lines = [
         `pi-codex-exec sandbox (macOS-only Seatbelt):`,
         `  mode: ${sandboxMode} (applies to new exec_command calls)`,
         `  source: ${sandboxSource}`,
         `  config: ${resolved.configPath}`,
-        `  extra denyWritePaths: ${sandboxDenyWritePaths.length ? sandboxDenyWritePaths.join(", ") : "(none)"}`,
+        `  effective protected paths (${sandboxMode === "protect-sensitive" ? protectedPaths.length : `0 active; ${protectedPaths.length} configured`}):`,
+        ...protectedPaths.map((p) => `    - ${p}`),
         `  active background sessions: ${
           liveSessions.length
             ? liveSessions.map((s) => `${s.id}[${s.sandboxed ? "SB" : "off"}]`).join(", ")

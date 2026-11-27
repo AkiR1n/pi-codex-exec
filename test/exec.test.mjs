@@ -228,8 +228,8 @@ test("registered session_shutdown clears live PTY and pipe sessions and reaps th
       handlers.set(event, handler);
     },
   });
-  assert.ok(commands.has("pty"));
-  assert.ok(commands.has("sandbox"));
+  assert.deepEqual([...commands].sort(), ["pty", "sandbox"]);
+  assert.deepEqual([...handlers.keys()].sort(), ["session_shutdown", "session_start"]);
   assert.equal(typeof handlers.get("session_start"), "function");
   const shutdown = handlers.get("session_shutdown");
   assert.equal(typeof shutdown, "function");
@@ -571,6 +571,14 @@ test("resolveSandboxConfig reports malformed config, invalid entries, and env ov
   assert.deepEqual(loaded.denyWritePaths, ["/Users/tester/protected"]);
   assert.ok(loaded.warnings.some((w) => /must be absolute/.test(w)));
 
+  const typoJson = dir + "/typo.json";
+  await writeFile(typoJson, JSON.stringify({ sandBox: "protect-sensitive", denyWritePath: ["~/x"] }));
+  const typo = resolveSandboxConfig(undefined, { configPath: typoJson, env: {}, home: "/Users/tester" });
+  assert.equal(typo.mode, "off");
+  assert.equal(typo.source, "default");
+  assert.ok(typo.warnings.some((w) => /Unknown sandbox config key.*"sandBox"/.test(w)));
+  assert.ok(typo.warnings.some((w) => /Unknown sandbox config key.*"denyWritePath"/.test(w)));
+
   const envOver = resolveSandboxConfig(undefined, {
     configPath: goodJson,
     env: { PI_CODEX_EXEC_SANDBOX: "off" },
@@ -580,7 +588,7 @@ test("resolveSandboxConfig reports malformed config, invalid entries, and env ov
   assert.equal(envOver.source, "env");
 });
 
-test("/sandbox hot-toggles subsequent exec_command calls, rejects headless off, and tracks per-PTY status accurately", { timeout: 10_000, skip: process.platform !== "darwin" }, async (t) => {
+test("/sandbox hot-toggles subsequent exec_command calls, rejects headless and RPC off, clips widget width, and tracks per-PTY status accurately", { timeout: 10_000, skip: process.platform !== "darwin" }, async (t) => {
   const root = await mkdtemp("/private/tmp/pi-codex-exec-toggle-");
   const protectedDir = root + "/protected";
   await mkdir(protectedDir);
@@ -589,26 +597,17 @@ test("/sandbox hot-toggles subsequent exec_command calls, rejects headless off, 
   const statuses = [];
   const widgets = [];
   const notes = [];
-  const interactiveCtx = {
-    cwd: root,
-    hasUI: true,
-    ui: {
-      setStatus: (key, status) => statuses.push({ key, status }),
-      setWidget: (key, content, opts) => {
-        const lines = typeof content === "function" ? content({}, { fg: (_r, t) => t }).render() : content;
-        widgets.push({ key, lines, opts });
-      },
-      notify: (text, level) => notes.push({ text, level }),
+  const ui = {
+    setStatus: (key, status) => statuses.push({ key, status }),
+    setWidget: (key, content, opts) => {
+      const component = typeof content === "function" ? content({}, { fg: (_r, text) => text }) : undefined;
+      widgets.push({ key, component, lines: component ? component.render(120) : content, opts });
     },
+    notify: (text, level) => notes.push({ text, level }),
   };
-  const headlessCtx = {
-    cwd: root,
-    hasUI: false,
-    ui: {
-      setStatus: (key, status) => statuses.push({ key, status }),
-      notify: (text, level) => notes.push({ text, level }),
-    },
-  };
+  const interactiveCtx = { cwd: root, hasUI: true, mode: "tui", ui };
+  const rpcCtx = { cwd: root, hasUI: true, mode: "rpc", ui };
+  const headlessCtx = { cwd: root, hasUI: false, mode: "print", ui };
 
   const { exec, ptySession, sandbox, sessionStart } = harness(
     t,
@@ -620,21 +619,29 @@ test("/sandbox hot-toggles subsequent exec_command calls, rejects headless off, 
   assert.equal(statuses.at(-1)?.status, "SB • /pty");
   assert.equal(widgets.at(-1)?.opts?.placement, "belowEditor");
   assert.match(widgets.at(-1)?.lines?.[0] ?? "", /SB on \(protect-sensitive\)/);
+  assert.ok((widgets.at(-1)?.component.render(20)[0] ?? "").length <= 20);
+  assert.equal(widgets.at(-1)?.component.render(0)[0], "");
 
-  // Headless / RPC caller cannot disable sandbox.
+  // Headless (print) and RPC (hasUI:true, mode:"rpc") callers cannot disable sandbox.
   await sandbox("off", headlessCtx);
-  assert.match(notes.at(-1)?.text ?? "", /interactive UI/i);
+  assert.match(notes.at(-1)?.text ?? "", /interactive TUI/i);
   assert.equal(notes.at(-1)?.level, "warning");
+
+  await sandbox("off", rpcCtx);
+  assert.match(notes.at(-1)?.text ?? "", /interactive TUI/i);
+  assert.equal(notes.at(-1)?.level, "warning");
+  assert.equal(statuses.at(-1)?.status, "SB • /pty");
 
   // Start a sandboxed background PTY while sandbox is ON.
   const bg = await exec({ tty: true, cmd: "echo ready; sleep 30", yield_time_ms: 150 });
   assert.equal(bg.status, "running");
   assert.equal(statuses.at(-1)?.status, "1 PTY [SB] • /pty");
 
-  // Interactive operator turns sandbox OFF: status must reflect mixed state (old PTY still SB, next is off).
+  // Interactive TUI operator turns sandbox OFF: status must reflect mixed state (old PTY still SB, next is off).
   await sandbox("off", interactiveCtx);
   assert.match(statuses.at(-1)?.status ?? "", /1 PTY \(1\/1 SB\) • next:off • \/pty/);
   assert.match(widgets.at(-1)?.lines?.[0] ?? "", /SB off \(runtime\).*1 PTY \(1\/1 SB\)/);
+  assert.ok((widgets.at(-1)?.component.render(30)[0] ?? "").length <= 30);
 
   // New command now writes to protectedDir freely.
   const allowed = await exec({ tty: false, cmd: `printf 'ok' > '${protectedDir}/after-off.txt'` });
@@ -654,7 +661,34 @@ test("/sandbox hot-toggles subsequent exec_command calls, rejects headless off, 
   await sandbox("status", interactiveCtx);
   assert.match(notes.at(-1)?.text ?? "", /mode: protect-sensitive/);
   assert.match(notes.at(-1)?.text ?? "", /source: runtime/);
+  assert.match(notes.at(-1)?.text ?? "", /effective protected paths/);
+  assert.match(notes.at(-1)?.text ?? "", /\.ssh/);
+  assert.match(notes.at(-1)?.text ?? "", new RegExp(protectedDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 
   await ptySession(bg.session_id, { kill: true });
   assert.equal(statuses.at(-1)?.status, "SB • /pty");
+});
+
+test("widget reports actual non-runtime source when mode is off and a background PTY is running", { timeout: 5_000 }, async (t) => {
+  const widgets = [];
+  const ctx = {
+    cwd: process.cwd(),
+    hasUI: true,
+    mode: "tui",
+    ui: {
+      setStatus: () => {},
+      setWidget: (key, content, opts) => {
+        const component = typeof content === "function" ? content({}, { fg: (role, text) => `${role}:${text}` }) : undefined;
+        widgets.push({ key, lines: component ? component.render(120) : content, opts });
+      },
+      notify: () => {},
+    },
+  };
+  const { exec, ptySession } = harness(t, ctx, { mode: "off" });
+  const bg = await exec({ tty: true, cmd: "echo hi; sleep 30", yield_time_ms: 150 });
+  assert.equal(bg.status, "running");
+  assert.match(widgets.at(-1)?.lines?.[0] ?? "", /^dim:  SB off \(override\)/);
+  assert.doesNotMatch(widgets.at(-1)?.lines?.[0] ?? "", /runtime/);
+  await ptySession(bg.session_id, { kill: true });
+  assert.equal(widgets.at(-1)?.lines, undefined);
 });
