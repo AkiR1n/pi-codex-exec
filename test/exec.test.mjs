@@ -587,12 +587,17 @@ test("/sandbox hot-toggles subsequent exec_command calls, rejects headless off, 
   t.after(() => rm(root, { recursive: true, force: true }));
 
   const statuses = [];
+  const widgets = [];
   const notes = [];
   const interactiveCtx = {
     cwd: root,
     hasUI: true,
     ui: {
       setStatus: (key, status) => statuses.push({ key, status }),
+      setWidget: (key, content, opts) => {
+        const lines = typeof content === "function" ? content({}, { fg: (_r, t) => t }).render() : content;
+        widgets.push({ key, lines, opts });
+      },
       notify: (text, level) => notes.push({ text, level }),
     },
   };
@@ -613,6 +618,8 @@ test("/sandbox hot-toggles subsequent exec_command calls, rejects headless off, 
 
   sessionStart();
   assert.equal(statuses.at(-1)?.status, "SB • /pty");
+  assert.equal(widgets.at(-1)?.opts?.placement, "belowEditor");
+  assert.match(widgets.at(-1)?.lines?.[0] ?? "", /SB on \(protect-sensitive\)/);
 
   // Headless / RPC caller cannot disable sandbox.
   await sandbox("off", headlessCtx);
@@ -627,6 +634,7 @@ test("/sandbox hot-toggles subsequent exec_command calls, rejects headless off, 
   // Interactive operator turns sandbox OFF: status must reflect mixed state (old PTY still SB, next is off).
   await sandbox("off", interactiveCtx);
   assert.match(statuses.at(-1)?.status ?? "", /1 PTY \(1\/1 SB\) • next:off • \/pty/);
+  assert.match(widgets.at(-1)?.lines?.[0] ?? "", /SB off \(runtime\).*1 PTY \(1\/1 SB\)/);
 
   // New command now writes to protectedDir freely.
   const allowed = await exec({ tty: false, cmd: `printf 'ok' > '${protectedDir}/after-off.txt'` });

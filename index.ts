@@ -810,18 +810,43 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
   function updateStatus() {
     const liveTtys = active().filter((session) => session.tty);
     const count = liveTtys.length;
+    let statusText: string | undefined;
     if (count) {
       const sbCount = liveTtys.filter((session) => session.sandboxed).length;
       if (sbCount === count && sandboxMode === "protect-sensitive") {
-        ui?.setStatus?.("pi-codex-exec", count + " PTY [SB] • /pty");
+        statusText = count + " PTY [SB] • /pty";
       } else if (sbCount === 0 && sandboxMode === "off") {
-        ui?.setStatus?.("pi-codex-exec", count + " PTY • /pty");
+        statusText = count + " PTY • /pty";
       } else {
         const nextTag = sandboxMode === "protect-sensitive" ? "SB" : "off";
-        ui?.setStatus?.("pi-codex-exec", `${count} PTY (${sbCount}/${count} SB) • next:${nextTag} • /pty`);
+        statusText = `${count} PTY (${sbCount}/${count} SB) • next:${nextTag} • /pty`;
       }
     } else {
-      ui?.setStatus?.("pi-codex-exec", sandboxMode === "protect-sensitive" ? "SB • /pty" : undefined);
+      statusText = sandboxMode === "protect-sensitive" ? "SB • /pty" : undefined;
+    }
+    ui?.setStatus?.("pi-codex-exec", statusText);
+
+    // Also render a compact belowEditor widget so sandbox state stays visible even when
+    // custom footers (such as pi-atelier) drop crowded extension status rails on narrow terminals.
+    if (typeof ui?.setWidget === "function") {
+      if (sandboxMode === "protect-sensitive" || sandboxSource === "runtime" || count > 0) {
+        const sbLabel = sandboxMode === "protect-sensitive"
+          ? "SB on (protect-sensitive)"
+          : "SB off (runtime)";
+        const extra = count > 0 ? ` • ${statusText}` : (sandboxMode === "protect-sensitive" ? " • /sandbox" : " • /sandbox on");
+        const line = `  ${sbLabel}${extra}`;
+        const isWarn = sandboxMode === "off" && sandboxSource === "runtime";
+        ui.setWidget(
+          "pi-codex-exec",
+          (_tui, theme) => ({
+            render: () => [theme?.fg ? theme.fg(isWarn ? "warning" : "dim", line) : line],
+            invalidate: () => {},
+          }),
+          { placement: "belowEditor" },
+        );
+      } else {
+        ui.setWidget("pi-codex-exec", undefined);
+      }
     }
   }
 
