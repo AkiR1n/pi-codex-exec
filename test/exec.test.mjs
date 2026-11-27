@@ -679,8 +679,8 @@ test("/sandbox hot-toggles subsequent exec_command calls, rejects headless and R
   sessionStart();
   assert.equal(statuses.at(-1)?.status, "SB • /pty");
   assert.equal(widgets.at(-1)?.opts?.placement, "belowEditor");
-  assert.match(widgets.at(-1)?.lines?.[0] ?? "", /SB on \(protect-sensitive\)/);
-  assert.ok((widgets.at(-1)?.component.render(20)[0] ?? "").length <= 20);
+  assert.equal(widgets.at(-1)?.lines?.[0], "  Sandbox ON");
+  assert.ok((widgets.at(-1)?.component.render(8)[0] ?? "").length <= 8);
   assert.equal(widgets.at(-1)?.component.render(0)[0], "");
 
   // Headless (print) and RPC (hasUI:true, mode:"rpc") callers cannot disable sandbox.
@@ -710,7 +710,7 @@ test("/sandbox hot-toggles subsequent exec_command calls, rejects headless and R
   // Interactive TUI operator turns sandbox OFF: status must reflect mixed state (old PTY still SB, next is off).
   await sandbox("off", interactiveCtx);
   assert.match(statuses.at(-1)?.status ?? "", /1 PTY \(1\/1 SB\) • next:off • \/pty/);
-  assert.match(widgets.at(-1)?.lines?.[0] ?? "", /SB off \(runtime\).*1 PTY \(1\/1 SB\)/);
+  assert.match(widgets.at(-1)?.lines?.[0] ?? "", /Sandbox OFF \(runtime\).*1 PTY \(1\/1 SB\)/);
   assert.ok((widgets.at(-1)?.component.render(30)[0] ?? "").length <= 30);
 
   // New command now writes to protectedDir freely.
@@ -757,7 +757,7 @@ test("widget reports actual non-runtime source when mode is off and a background
   const { exec, ptySession } = harness(t, ctx, { mode: "off" });
   const bg = await exec({ tty: true, cmd: "echo hi; sleep 30", yield_time_ms: 150 });
   assert.equal(bg.status, "running");
-  assert.match(widgets.at(-1)?.lines?.[0] ?? "", /^dim:  SB off \(override\)/);
+  assert.match(widgets.at(-1)?.lines?.[0] ?? "", /^dim:  Sandbox OFF \(override\)/);
   assert.doesNotMatch(widgets.at(-1)?.lines?.[0] ?? "", /runtime/);
   await ptySession(bg.session_id, { kill: true });
   assert.equal(widgets.at(-1)?.lines, undefined);

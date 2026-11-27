@@ -866,9 +866,9 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
     if (typeof ui?.setWidget === "function") {
       if (sandboxMode === "protect-sensitive" || sandboxSource === "runtime" || count > 0) {
         const sbLabel = sandboxMode === "protect-sensitive"
-          ? "SB on (protect-sensitive)"
-          : `SB off (${sandboxSource})`;
-        const extra = count > 0 ? ` • ${statusText}` : (sandboxMode === "protect-sensitive" ? " • /sandbox" : " • /sandbox on");
+          ? "Sandbox ON"
+          : `Sandbox OFF (${sandboxSource})`;
+        const extra = count > 0 ? ` • ${statusText}` : (sandboxMode === "protect-sensitive" ? "" : " • /sandbox on");
         const line = `  ${sbLabel}${extra}`;
         const isWarn = sandboxMode === "off" && sandboxSource === "runtime";
         ui.setWidget(
