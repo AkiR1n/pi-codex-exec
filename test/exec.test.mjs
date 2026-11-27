@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
+import { Writable } from "node:stream";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import register, { buildSeatbeltProfile, createExecution, expandSandboxPath, pruneStaleLogs, resolveSandboxConfig } from "../index.ts";
+import register, { buildSeatbeltProfile, createExecution, expandSandboxPath, pruneStaleLogs, resolveProtectedWritePaths, resolveSandboxConfig } from "../index.ts";
 
 function harness(t, ctx = { cwd: process.cwd() }, sandboxOverride = { mode: "off" }) {
   const { execTool, ptyTool, writeTool, ptyCommand, sandboxCommand, onSessionStart, shutdown } = createExecution(sandboxOverride);
@@ -588,6 +589,66 @@ test("resolveSandboxConfig reports malformed config, invalid entries, and env ov
   assert.equal(envOver.source, "env");
 });
 
+const printCtx = {
+  cwd: process.cwd(),
+  hasUI: false,
+  mode: "print",
+  ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+};
+
+function capturePrintOutput(t) {
+  const output = { stdout: "", stderr: "" };
+  t.mock.method(process.stderr, "write", (chunk) => {
+    output.stderr += chunk;
+    return true;
+  });
+  // Model Pi's stdout guard and capture writes to the underlying stdout stream.
+  t.mock.method(process.stdout, "write", (chunk) => process.stderr.write(chunk));
+  const write = Writable.prototype.write;
+  t.mock.method(Writable.prototype, "write", function (chunk, ...args) {
+    if (this !== process.stdout) return write.call(this, chunk, ...args);
+    output.stdout += chunk;
+    return true;
+  });
+  return output;
+}
+
+test("print emits session_start sandbox config warnings to stderr", (t) => {
+  const output = capturePrintOutput(t);
+  const { sessionStart } = harness(t, printCtx, { mode: "off", denyWritePaths: ["relative/path"] });
+  sessionStart();
+  assert.match(output.stderr, /pi-codex-exec sandbox config warning/);
+  assert.match(output.stderr, /must be absolute or start with ~\//);
+  assert.equal(output.stdout, "");
+});
+
+test("print emits the /sandbox off refusal to stderr", async (t) => {
+  const output = capturePrintOutput(t);
+  const { sandbox } = harness(t, printCtx, { mode: "protect-sensitive" });
+  await sandbox("off");
+  assert.match(output.stderr, /Refused: \/sandbox off requires an interactive TUI session/);
+  assert.equal(output.stdout, "");
+});
+
+test("print emits the /sandbox status report with all effective protected paths to stdout", async (t) => {
+  const output = capturePrintOutput(t);
+  const customPath = "/tmp/pi-codex-exec-status-protected";
+  const { sandbox, sessionStart } = harness(t, printCtx, {
+    mode: "protect-sensitive",
+    denyWritePaths: [customPath, "relative/path"],
+  });
+  sessionStart();
+  const startupWarnings = output.stderr;
+  await sandbox("status");
+  const effectivePaths = resolveProtectedWritePaths([customPath]);
+  assert.match(output.stdout, /mode: protect-sensitive/);
+  assert.match(output.stdout, /source: override/);
+  const lines = output.stdout.split("\n");
+  assert.ok(lines.includes(`  effective protected paths (${effectivePaths.length}):`));
+  assert.deepEqual(lines.filter((line) => line.startsWith("    - ")), effectivePaths.map((path) => `    - ${path}`));
+  assert.equal(output.stderr, startupWarnings);
+});
+
 test("/sandbox hot-toggles subsequent exec_command calls, rejects headless and RPC off, clips widget width, and tracks per-PTY status accurately", { timeout: 10_000, skip: process.platform !== "darwin" }, async (t) => {
   const root = await mkdtemp("/private/tmp/pi-codex-exec-toggle-");
   const protectedDir = root + "/protected";
@@ -623,14 +684,23 @@ test("/sandbox hot-toggles subsequent exec_command calls, rejects headless and R
   assert.equal(widgets.at(-1)?.component.render(0)[0], "");
 
   // Headless (print) and RPC (hasUI:true, mode:"rpc") callers cannot disable sandbox.
-  await sandbox("off", headlessCtx);
-  assert.match(notes.at(-1)?.text ?? "", /interactive TUI/i);
-  assert.equal(notes.at(-1)?.level, "warning");
-
-  await sandbox("off", rpcCtx);
-  assert.match(notes.at(-1)?.text ?? "", /interactive TUI/i);
-  assert.equal(notes.at(-1)?.level, "warning");
+  const stderrWrite = t.mock.method(process.stderr, "write", () => true);
+  try {
+    await sandbox("off", headlessCtx);
+    await sandbox("off", rpcCtx);
+  } finally {
+    stderrWrite.mock.restore();
+  }
+  assert.equal(stderrWrite.mock.callCount(), 2);
+  for (const { arguments: [message] } of stderrWrite.mock.calls) {
+    assert.match(message, /interactive TUI/i);
+  }
+  assert.deepEqual(notes, []);
   assert.equal(statuses.at(-1)?.status, "SB • /pty");
+
+  await sandbox("status", rpcCtx);
+  assert.match(notes.at(-1)?.text ?? "", /mode: protect-sensitive/);
+  assert.equal(notes.at(-1)?.level, "info");
 
   // Start a sandboxed background PTY while sandbox is ON.
   const bg = await exec({ tty: true, cmd: "echo ready; sleep 30", yield_time_ms: 150 });

@@ -88,10 +88,12 @@ To enable kernel-level write protection for sensitive directories on macOS:
     "denyWritePaths": ["~/my-private-data"]
   }
   ```
-- **Live toggling inside a running Pi TUI session**:
-  - `/sandbox status` (or `/sandbox`) shows the active mode, source (`config` / `env` / `runtime` / `default`), effective protected paths, per-PTY sandbox state, and any config warnings.
+- **Inspect or toggle protection during a Pi session**:
+  - `/sandbox status` (or `/sandbox`) shows the active mode, source (`config` / `env` / `runtime` / `default`), all effective protected paths, and per-PTY sandbox state.
   - `/sandbox on` enables `protect-sensitive` for all subsequent `exec_command` calls without restarting Pi.
-  - `/sandbox off` disables Seatbelt for subsequent `exec_command` calls (interactive TUI only; rejected in headless / RPC mode). Existing background PTYs retain the sandbox policy they started with and are labeled accurately in the status bar.
+  - `/sandbox off` disables Seatbelt for subsequent `exec_command` calls and requires an interactive TUI. Print and RPC sessions reject it. Existing background PTYs retain their launch policy and the TUI status bar shows their state.
+- The TUI uses the status bar and widget for sandbox state and notifications for command results and configuration warnings. The TUI status report also includes configuration warnings.
+- Print (`pi -p`) and RPC write startup configuration warnings and command refusals to stderr. In print mode, an explicit `/sandbox status` writes plain text to the same stdout stream as model answers. In RPC mode, status arrives on stdout as an `extension_ui_request` JSON event with method `notify`.
 
 When active:
 - Workspace and `/tmp` reads/writes work normally; reads of protected paths still work (e.g. `ssh` reading `~/.ssh/config`).
@@ -114,7 +116,7 @@ When active:
 npm test
 ```
 
-Runs 27 unit & integration tests covering native PTYs, pipes, `pty_session` polling/killing/runtime input-rejection, Ctrl+C / Ctrl+D, ANSI control-sequence normalization across polls, UTF-8 / surrogate-safe truncation, multi-turn real-time session log mirroring, 24 h stale log pruning, `setsid` / reparented descendant reaping, `AbortSignal`, `~/` and symlink-ancestor Seatbelt path resolution, config diagnostics (including unknown-key warnings), `/sandbox` live toggling (including RPC/headless rejection and width-safe widget rendering), and real macOS `sandbox-exec` kernel write blocking.
+Runs 30 unit and integration tests covering native PTYs, pipes, `pty_session` polling/killing/runtime input-rejection, Ctrl+C / Ctrl+D, ANSI control-sequence normalization across polls, UTF-8 / surrogate-safe truncation, multi-turn real-time session log mirroring, 24 h stale log pruning, `setsid` / reparented descendant reaping, `AbortSignal`, `~/` and symlink-ancestor Seatbelt path resolution, config diagnostics (including unknown-key warnings), `/sandbox` live toggling (including print-mode stderr and stdout, RPC/headless rejection, and width-safe widget rendering), and real macOS `sandbox-exec` kernel write blocking.
 
 ## References & Attribution
 

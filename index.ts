@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, closeSync, existsSync, lstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { constants, homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { setTimeout as delay } from "node:timers/promises";
 import { hasNative, spawn as spawnPty } from "zigpty";
@@ -783,7 +784,30 @@ function toolResult(result: {
   return { structuredContent: result, content: [{ type: "text" as const, text: lines.filter(Boolean).join("\n") }] };
 }
 
-type ExecutionContext = Pick<ExtensionContext, "cwd" | "ui"> & { hasUI?: boolean; mode?: string };
+type ExecutionContext = Pick<ExtensionContext, "cwd" | "ui"> & { hasUI?: boolean; mode?: ExtensionContext["mode"] };
+type NoticeType = NonNullable<Parameters<ExtensionContext["ui"]["notify"]>[1]>;
+
+function getNoticeUI(ctx?: ExecutionContext) {
+  return ctx?.hasUI === true && typeof ctx.ui?.notify === "function" ? ctx.ui : undefined;
+}
+
+function emitNotice(message: string, type: NoticeType, ctx?: ExecutionContext) {
+  const ui = getNoticeUI(ctx);
+  if (ctx?.mode === "tui" && ui) {
+    ui.notify(message, type);
+  } else if (type !== "info" || ctx?.mode === "json") {
+    process.stderr.write(message + "\n");
+  } else if (ctx?.mode === "rpc") {
+    // Pi wraps this notification in an RPC event on stdout.
+    if (ui) ui.notify(message, type);
+    else process.stderr.write(message + "\n");
+  } else if (ctx?.mode === "print") {
+    // Pi routes process.stdout.write to stderr in print mode. Write command results to the underlying stream.
+    Writable.prototype.write.call(process.stdout, message + "\n");
+  } else {
+    process.stdout.write(message + "\n");
+  }
+}
 
 export function createExecution(sandboxOverride?: SandboxConfig) {
   pruneStaleLogs();
@@ -871,7 +895,7 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
     updateStatus();
     if (sandboxWarnings.length > 0) {
       const msg = "pi-codex-exec sandbox config warning:\n" + sandboxWarnings.map((w) => "- " + w).join("\n");
-      ui?.notify?.(msg, "warning");
+      emitNotice(msg, "warning", ctx);
     }
   }
 
@@ -1055,7 +1079,7 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
     description: "Inspect or live-toggle macOS Seatbelt write protection: /sandbox [status | on | off].",
     async handler(args: string, ctx?: ExecutionContext) {
       ui = ctx?.ui ?? ui;
-      const notify = (text: string, level: "info" | "warning" | "error" = "info") => ui?.notify?.(text, level);
+      const notify = (text: string, level: NoticeType) => emitNotice(text, level, ctx);
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const action = (parts[0] ?? "status").toLowerCase();
       if (parts.length > 1 || (action !== "status" && action !== "on" && action !== "off")) {
@@ -1103,11 +1127,12 @@ export function createExecution(sandboxOverride?: SandboxConfig) {
             : "(none)"
         }`,
       ];
-      if (sandboxWarnings.length) {
+      const showWarningsInStatus = ctx?.mode === "tui" && getNoticeUI(ctx) && sandboxWarnings.length > 0;
+      if (showWarningsInStatus) {
         lines.push("  warnings:");
         for (const w of sandboxWarnings) lines.push(`    - ${w}`);
       }
-      notify(lines.join("\n"), sandboxWarnings.length ? "warning" : "info");
+      notify(lines.join("\n"), showWarningsInStatus ? "warning" : "info");
     },
   };
 

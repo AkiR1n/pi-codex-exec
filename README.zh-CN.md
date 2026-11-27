@@ -73,9 +73,11 @@ npm install
   }
   ```
 - **运行中热切换（无需重启 Pi）**：
-  - `/sandbox status`（或 `/sandbox`）：查看当前沙箱模式、来源（`config` / `env` / `runtime` / `default`）、生效保护路径、各后台 PTY 沙箱状态与配置告警；
+  - `/sandbox status`（或 `/sandbox`）显示当前沙箱模式、来源（`config` / `env` / `runtime` / `default`）、全部生效保护路径及各后台 PTY 的沙箱状态。
   - `/sandbox on`：立即对后续新启动的 `exec_command` 开启 `protect-sensitive`；
-  - `/sandbox off`：对后续新启动的 `exec_command` 临时关闭沙箱（仅限交互式 TUI 操作者，无头 / RPC 模式下拒绝关闭）；已运行的旧后台 PTY 保留其启动时的策略并在状态栏准确标注。
+  - `/sandbox off` 对后续新启动的 `exec_command` 关闭沙箱，仅限交互式 TUI。Print 和 RPC 模式均拒绝此命令。已有后台 PTY 保留启动时的策略，其状态显示在 TUI 状态栏。
+- TUI 在状态栏和 widget 显示沙箱状态，通过通知显示命令结果与配置告警。TUI 的状态报告也包含配置告警。
+- Print（`pi -p`）和 RPC 将启动时的配置告警及命令拒绝原因写入 stderr。Print 模式下，显式运行 `/sandbox status` 会将纯文本结果写入模型回答使用的同一个 stdout 流。RPC 模式下，状态通过 stdout 上方法为 `notify` 的 `extension_ui_request` JSON 事件返回。
 
 启用后，对 `~/.pi/agent/sessions`、`~/.pi/agent/auth.json`、`~/.pi/agent/extensions/pi-permission-system` 与 `~/.pi/agent/extensions/pi-permission-auto-review`、`~/.config/magpie`、`~/.ssh`、`~/.gnupg`、`~/.aws` 以及自定义 `denyWritePaths` 的任意写入都会被 macOS 内核拒绝（`Operation not permitted`），但仍保留正常只读访问（如 `ssh` 读取 `~/.ssh/config`）；状态栏会显示 `SB • /pty`（或 `N PTY [SB] • /pty`，热切混合状态时显示精确计数）便于区分。
 
@@ -95,7 +97,7 @@ npm install
 npm test
 ```
 
-包含 27 条单元与集成测试，覆盖原生 PTY、管道、`pty_session` 轮询/终止/运行时拒写校验、Ctrl+C/Ctrl+D、跨轮 ANSI 转义归一化、UTF-8 安全截断、跨轮实时全量日志镜像、24 小时旧日志清理、`setsid` 后代回收、`AbortSignal`、`~/` 与符号链接祖先路径解析、配置告警（含未知键检测）、`/sandbox` 运行中热切换（含 RPC/无头拒绝与窄屏宽度安全截断）以及 macOS `sandbox-exec` 内核写拦截。
+包含 30 条单元与集成测试，覆盖原生 PTY、管道、`pty_session` 轮询/终止/运行时拒写校验、Ctrl+C/Ctrl+D、跨轮 ANSI 转义归一化、UTF-8 安全截断、跨轮实时全量日志镜像、24 小时旧日志清理、`setsid` 后代回收、`AbortSignal`、`~/` 与符号链接祖先路径解析、配置告警（含未知键检测）、`/sandbox` 运行中热切换（含 print 模式 stderr 与 stdout 输出、RPC/无头拒绝与窄屏宽度安全截断）以及 macOS `sandbox-exec` 内核写拦截。
 
 ## 参考声明
 
